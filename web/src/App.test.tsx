@@ -1,0 +1,176 @@
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import App from './App';
+
+// 真实接口地址由 vite.config.ts 的 test.env 注入（容器内为 http://api:8000）
+const BASE: string = import.meta.env.VITE_API_URL ?? '';
+
+async function resetStage() {
+  const res = await fetch(`${BASE}/api/reset`, { method: 'POST' });
+  if (!res.ok) throw new Error(`reset 失败: ${res.status}`);
+}
+
+async function dbBatten(battenId: string) {
+  const res = await fetch(`${BASE}/api/battens/${battenId}`);
+  if (!res.ok) throw new Error(`查询吊杆失败: ${res.status}`);
+  return res.json();
+}
+
+async function renderLoaded() {
+  const user = userEvent.setup();
+  render(<App />);
+  // 等待真实接口返回、两根吊杆渲染完成
+  await screen.findByRole('button', { name: /G-01/ });
+  await screen.findByRole('button', { name: /G-02/ });
+  return user;
+}
+
+async function submitPiece(
+  user: ReturnType<typeof userEvent.setup>,
+  pieceId: string,
+  weight: string,
+) {
+  await user.clear(screen.getByLabelText('配重片标识'));
+  await user.type(screen.getByLabelText('配重片标识'), pieceId);
+  await user.clear(screen.getByLabelText('重量（克）'));
+  await user.type(screen.getByLabelText('重量（克）'), weight);
+  await user.click(screen.getByRole('button', { name: '登记装载' }));
+}
+
+beforeEach(resetStage);
+afterEach(cleanup);
+
+describe('吊杆配重装载页（真实接口反馈）', () => {
+  it('页面加载后展示两根预置吊杆，且与数据库状态一致', async () => {
+    await renderLoaded();
+
+    const g01 = screen.getByRole('button', { name: /G-01/ });
+    const g02 = screen.getByRole('button', { name: /G-02/ });
+    expect(within(g01).getByText('核定 30000 克')).toBeInTheDocument();
+    expect(within(g01).getByText('总重 0 克')).toBeInTheDocument();
+    expect(within(g01).getByText('剩余 30000 克')).toBeInTheDocument();
+    expect(within(g02).getByText('核定 50000 克')).toBeInTheDocument();
+
+    // 默认选中 G-01，明细区展示空吊杆
+    expect(await screen.findByTestId('total')).toHaveTextContent('0 克');
+    expect(screen.getByTestId('remaining')).toHaveTextContent('30000 克');
+    expect(screen.getByText('暂无已接纳配重片')).toBeInTheDocument();
+
+    // 与数据库直接核对
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(0);
+    expect(db.remaining_grams).toBe(30000);
+  });
+
+  it('合法配重片被接纳，页面与数据库同步更新', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-0001', '20000');
+
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('已接纳');
+    expect(status).toHaveTextContent('当前总重 20000 克');
+    expect(status).toHaveTextContent('剩余量 10000 克');
+
+    // 提交后页面会重新拉取接口，等待明细区刷新到最新状态
+    await waitFor(() => expect(screen.getByTestId('total')).toHaveTextContent('20000 克'));
+    expect(screen.getByTestId('remaining')).toHaveTextContent('10000 克');
+    expect(screen.getByRole('cell', { name: 'CW-0001' })).toBeInTheDocument();
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(20000);
+    expect(db.remaining_grams).toBe(10000);
+    expect(db.loads.map((l: { piece_id: string }) => l.piece_id)).toEqual(['CW-0001']);
+  });
+
+  it('恰好装满核定值时允许接纳', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-FULL-1', '25000');
+    await screen.findByRole('status');
+
+    await submitPiece(user, 'CW-FULL-2', '5000');
+    const status = await screen.findByRole('status');
+    await waitFor(() => expect(status).toHaveTextContent('剩余量 0 克'));
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(30000);
+    expect(db.remaining_grams).toBe(0);
+  });
+
+  it('超出核定值被明确拒绝，且失败请求不落库', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-KEEP', '20000');
+    await screen.findByRole('status');
+
+    await submitPiece(user, 'CW-OVER', '20000');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('已拒绝');
+    expect(alert).toHaveTextContent('超出核定');
+
+    // 页面状态保持第一笔之后的样子
+    await waitFor(() => expect(screen.getByTestId('total')).toHaveTextContent('20000 克'));
+    expect(screen.getByTestId('remaining')).toHaveTextContent('10000 克');
+
+    // 数据库里只有成功的那一笔
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(20000);
+    expect(db.loads).toHaveLength(1);
+    expect(db.loads[0].piece_id).toBe('CW-KEEP');
+  });
+
+  it('同一标识在全库只能成功一次', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-DUP', '5000');
+    await screen.findByRole('status');
+
+    // 换到 G-02 再用同一标识登记
+    await user.selectOptions(screen.getByLabelText('选择吊杆'), 'G-02');
+    await waitFor(() =>
+      expect(screen.getByTestId('remaining')).toHaveTextContent('50000 克'),
+    );
+
+    await submitPiece(user, 'CW-DUP', '5000');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('已拒绝');
+    expect(alert).toHaveTextContent('不能重复使用');
+
+    const db = await dbBatten('G-02');
+    expect(db.total_grams).toBe(0);
+    expect(db.loads).toHaveLength(0);
+  });
+
+  it('重量超出 100～25000 克范围被明确拒绝', async () => {
+    const user = await renderLoaded();
+
+    await submitPiece(user, 'CW-LIGHT', '50');
+    expect(await screen.findByRole('alert')).toHaveTextContent('100～25000');
+
+    await submitPiece(user, 'CW-HEAVY', '26000');
+    // 第二次拒绝会替换提示内容，等待新文案出现
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('收到 26000 克'),
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('100～25000');
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(0);
+    expect(db.loads).toHaveLength(0);
+  });
+
+  it('页面重新渲染（刷新）后状态仍与数据库一致', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-PERSIST', '12000');
+    await screen.findByRole('status');
+    cleanup();
+
+    // 模拟刷新：全新渲染，数据只能来自接口
+    render(<App />);
+    expect(await screen.findByTestId('total')).toHaveTextContent('12000 克');
+    expect(screen.getByTestId('remaining')).toHaveTextContent('18000 克');
+    expect(screen.getByRole('cell', { name: 'CW-PERSIST' })).toBeInTheDocument();
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(12000);
+    expect(db.remaining_grams).toBe(18000);
+  });
+});
