@@ -85,14 +85,23 @@ def test_weight_bounds_are_enforced(base_url):
 
 
 def test_non_integer_weight_is_rejected(base_url):
-    resp = httpx.post(
-        f"{base_url}/api/battens/G-01/loads",
-        json={"piece_id": "CW-FLOAT", "weight_grams": 199.5},
-        timeout=10,
-    )
-    assert resp.status_code == 422
-    assert resp.json()["accepted"] is False
-    assert batten_state(base_url, "G-01")["loads"] == []
+    """字符串、小数、布尔等伪装的重量必须明确拒绝且不保存。"""
+    bad_payloads = ["100", "20000", 100.0, 199.5, True, None]
+    for i, bad_weight in enumerate(bad_payloads):
+        resp = httpx.post(
+            f"{base_url}/api/battens/G-01/loads",
+            json={"piece_id": f"CW-TYPE-{i}", "weight_grams": bad_weight},
+            timeout=10,
+        )
+        assert resp.status_code == 422, f"载荷 {bad_weight!r} 未被拒绝: {resp.text}"
+        body = resp.json()
+        assert body["accepted"] is False
+        assert body["reason"] == "INVALID_INPUT"
+
+    # 全部被拒后吊杆必须仍是空的：失败请求不落库
+    state = batten_state(base_url, "G-01")
+    assert state["total_grams"] == 0
+    assert state["loads"] == []
 
 
 def test_piece_id_is_unique_across_all_battens(base_url):

@@ -37,11 +37,13 @@ export default function App() {
     event.preventDefault();
     setFeedback(null);
     const trimmedId = pieceId.trim();
-    const grams = Number(weight);
-    if (!trimmedId || weight.trim() === '' || !Number.isInteger(grams)) {
-      setFeedback({ kind: 'error', text: '请输入配重片标识和整数克重量' });
+    const trimmedWeight = weight.trim();
+    // 按原始输入严格判定整数：字符串 "100.0"、"1e2" 等一律在页面明确拒绝
+    if (!trimmedId || !/^-?\d+$/.test(trimmedWeight)) {
+      setFeedback({ kind: 'error', text: '请输入配重片标识，重量必须是整数克数' });
       return;
     }
+    const grams = Number(trimmedWeight);
     setSubmitting(true);
     try {
       const { body } = await submitLoad(selected, trimmedId, grams);
@@ -109,10 +111,10 @@ export default function App() {
         <label htmlFor="weight">重量（克）</label>
         <input
           id="weight"
-          type="number"
-          step="1"
+          type="text"
+          inputMode="numeric"
           value={weight}
-          placeholder="100 ~ 25000"
+          placeholder="100 ~ 25000 的整数"
           onChange={(e) => setWeight(e.target.value)}
         />
 

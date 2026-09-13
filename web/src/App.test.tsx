@@ -157,6 +157,44 @@ describe('吊杆配重装载页（真实接口反馈）', () => {
     expect(db.loads).toHaveLength(0);
   });
 
+  it('小数或非整数输入在页面被明确拒绝且不保存', async () => {
+    const user = await renderLoaded();
+
+    await submitPiece(user, 'CW-DEC', '100.0');
+    expect(await screen.findByRole('alert')).toHaveTextContent('整数克数');
+
+    await submitPiece(user, 'CW-ABC', 'abc');
+    expect(await screen.findByRole('alert')).toHaveTextContent('整数克数');
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(0);
+    expect(db.loads).toHaveLength(0);
+  });
+
+  it('接口严格拒绝字符串或小数重量（真实接口）', async () => {
+    // 手工构造原始 JSON 报文：JS 的 JSON.stringify(100.0) 会变成整数 100
+    const badBodies = [
+      '{"piece_id":"CW-STRICT-S1","weight_grams":"100"}',
+      '{"piece_id":"CW-STRICT-S2","weight_grams":100.0}',
+      '{"piece_id":"CW-STRICT-S3","weight_grams":"20000"}',
+    ];
+    for (const raw of badBodies) {
+      const res = await fetch(`${BASE}/api/battens/G-01/loads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: raw,
+      });
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(body.accepted).toBe(false);
+      expect(body.reason).toBe('INVALID_INPUT');
+    }
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(0);
+    expect(db.loads).toHaveLength(0);
+  });
+
   it('页面重新渲染（刷新）后状态仍与数据库一致', async () => {
     const user = await renderLoaded();
     await submitPiece(user, 'CW-PERSIST', '12000');
