@@ -29,6 +29,13 @@ function todayStr(): string {
   return `${d.getFullYear()}-${mm}-${dd}`;
 }
 
+// 与服务端同一口径：空白与零宽空格等不可见字符（Cc/Cf/Zl/Zp）不算有效说明内容
+const VISIBLE_CHAR = /[^\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+function hasVisibleText(value: string): boolean {
+  return VISIBLE_CHAR.test(value);
+}
+
 export default function App() {
   const [battens, setBattens] = useState<BattenSummary[]>([]);
   const [selected, setSelected] = useState('G-01');
@@ -290,11 +297,11 @@ export default function App() {
       setInspFeedback({ kind: 'error', text: '请选择营业日期' });
       return;
     }
-    // 页面预检与接口口径一致：任一项异常时说明不能为空；
-    // 结论不由页面判定，始终以服务端归档结果为准
+    // 页面预检与接口口径一致：任一项异常时说明不能为空（只含空白或
+    // 零宽空格等不可见字符视为未填写）；结论不由页面判定，以服务端为准
     const anyAbnormal = !brakeOk || !ropeOk || !limitOk;
     const trimmedNote = note.trim();
-    if (anyAbnormal && !trimmedNote) {
+    if (anyAbnormal && !hasVisibleText(trimmedNote)) {
       setInspFeedback({
         kind: 'error',
         text: '存在异常检查项时，异常说明不能为空',
@@ -308,7 +315,7 @@ export default function App() {
         brake_ok: brakeOk,
         rope_ok: ropeOk,
         limit_ok: limitOk,
-        abnormality_note: trimmedNote || null,
+        abnormality_note: hasVisibleText(trimmedNote) ? trimmedNote : null,
       });
       if (body.accepted && body.inspection) {
         setInspResult(body.inspection);

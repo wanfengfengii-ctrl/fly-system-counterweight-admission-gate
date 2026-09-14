@@ -113,6 +113,51 @@ def test_missing_abnormality_note_is_rejected_and_not_persisted(base_url):
     assert inspection_history(base_url, "G-01") == []
 
 
+def test_invisible_only_note_is_rejected_and_not_persisted(base_url):
+    """只含零宽空格等不可见字符的说明看起来为空：明确拒绝，不留下巡检记录。"""
+    for invisible_note in (
+        "\u200b",              # 零宽空格
+        "\u200b\u200b\u200b",           # 多个零宽空格
+        " \u200b ",            # 零宽空格夹普通空格
+        "\u200c\u200d",   # 零宽非连接符 / 零宽连接符
+        "\ufeff",              # BOM（零宽不换行空格）
+        "\u2060",              # 单词连接符
+        "\u00ad",              # 软连字符
+        "\u3000\u200b",          # 全角空格 + 零宽空格
+    ):
+        resp = submit_inspection(
+            base_url, "G-01", today_str(), brake_ok=False, note=invisible_note
+        )
+        assert resp.status_code == 422, f"说明 {invisible_note!r} 未被拒绝: {resp.text}"
+        body = resp.json()
+        assert body["accepted"] is False
+        assert body["reason"] == "MISSING_ABNORMALITY_NOTE"
+
+    # 全部被拒后不留下任何巡检记录
+    assert inspection_history(base_url, "G-01") == []
+
+
+def test_invisible_only_note_is_stored_as_empty_when_all_ok(base_url):
+    """三项全部正常时，只含不可见字符的说明按未填写归档（说明为空）。"""
+    resp = submit_inspection(base_url, "G-01", today_str(), note="\u200b \u200b")
+    assert resp.status_code == 201, resp.text
+    rec = resp.json()["inspection"]
+    assert rec["conclusion"] == "PASS"
+    assert rec["abnormality_note"] is None
+    assert inspection_history(base_url, "G-01")[0]["abnormality_note"] is None
+
+
+def test_note_with_visible_content_is_kept_verbatim(base_url):
+    """说明中夹带不可见字符但有可见内容：正常归档，原文保留。"""
+    resp = submit_inspection(
+        base_url, "G-01", today_str(), rope_ok=False, note="钢丝\u200b绳断丝"
+    )
+    assert resp.status_code == 201, resp.text
+    rec = resp.json()["inspection"]
+    assert rec["conclusion"] == "NEEDS_ATTENTION"
+    assert rec["abnormality_note"] == "钢丝\u200b绳断丝"
+
+
 def test_conclusion_cannot_be_specified_by_client(base_url):
     """客户端夹带的结论字段不被采信：异常项存在时服务端仍判定需处理。"""
     resp = httpx.post(

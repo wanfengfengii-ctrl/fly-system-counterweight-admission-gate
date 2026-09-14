@@ -12,6 +12,20 @@ def _contains_invisible_chars(value: str) -> bool:
     return any(unicodedata.category(ch) in _INVISIBLE_CATEGORIES for ch in value)
 
 
+def visible_content(value: str) -> str:
+    """去掉空白与不可见字符后剩下的可见内容。
+
+    与标识校验同一套不可见字符定义（控制字符、格式字符、行/段分隔符）：
+    零宽空格（U+200B）、零宽连接符、BOM 等都不算有效内容——只含这些字符的
+    说明在历史里看起来为空，必须视为未填写。
+    """
+    return "".join(
+        ch
+        for ch in value
+        if not ch.isspace() and unicodedata.category(ch) not in _INVISIBLE_CATEGORIES
+    )
+
+
 class LoadCreate(BaseModel):
     piece_id: str = Field(min_length=1, max_length=128)
     # 严格整数：字符串 "100"、小数 100.0、布尔值一律拒绝，不做隐式转换

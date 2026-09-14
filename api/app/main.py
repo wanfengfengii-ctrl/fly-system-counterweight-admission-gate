@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
 from .models import Batten, Inspection, Load
-from .schemas import InspectionCreate, LoadCreate, TransferCreate, WeightCorrect
+from .schemas import (
+    InspectionCreate,
+    LoadCreate,
+    TransferCreate,
+    WeightCorrect,
+    visible_content,
+)
 
 MIN_WEIGHT_GRAMS = 100
 MAX_WEIGHT_GRAMS = 25000
@@ -655,6 +661,10 @@ def create_inspection(
 
     all_ok = payload.brake_ok and payload.rope_ok and payload.limit_ok
     note = (payload.abnormality_note or "").strip()
+    # 只含空白或零宽空格等不可见字符的说明在历史里看起来为空，
+    # 一律视为未填写：存在异常项时明确拒绝，全部正常时按无说明归档
+    if not visible_content(note):
+        note = ""
     if not all_ok and not note:
         return reject(
             422,

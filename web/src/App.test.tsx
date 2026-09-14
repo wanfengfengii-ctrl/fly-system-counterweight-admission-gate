@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import App from './App';
@@ -647,6 +647,40 @@ describe('吊杆日检（真实接口反馈）', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('异常说明不能为空');
+
+    // 数据库中没有留下任何巡检记录
+    const res = await fetch(`${BASE}/api/battens/G-01/inspections`);
+    const db = await res.json();
+    expect(db.inspections).toHaveLength(0);
+  });
+
+  it('只填零宽空格作为异常说明时被明确拒绝，不产生巡检记录', async () => {
+    const user = await renderLoaded();
+
+    await user.click(screen.getByLabelText('钢丝绳正常'));
+    // 零宽空格（U+200B）看起来为空，不能算作异常说明
+    fireEvent.change(screen.getByLabelText('异常说明'), {
+      target: { value: '\u200b\u200b' },
+    });
+    await user.click(screen.getByRole('button', { name: '提交日检' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('异常说明不能为空');
+
+    // 服务端口径一致：绕过页面预检直接提交零宽空格说明同样被拒绝
+    const direct = await fetch(`${BASE}/api/battens/G-01/inspections`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        inspection_date: localTodayStr(),
+        brake_ok: false,
+        rope_ok: true,
+        limit_ok: true,
+        abnormality_note: '\u200b',
+      }),
+    });
+    expect(direct.status).toBe(422);
+    expect((await direct.json()).reason).toBe('MISSING_ABNORMALITY_NOTE');
 
     // 数据库中没有留下任何巡检记录
     const res = await fetch(`${BASE}/api/battens/G-01/inspections`);
