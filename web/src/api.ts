@@ -3,6 +3,7 @@ import type {
   BattenSummary,
   CorrectResult,
   LoadResult,
+  RemoveResult,
   TransferResult,
 } from './types';
 
@@ -61,5 +62,12 @@ export function correctLoadWeight(
       method: 'POST',
       body: JSON.stringify({ weight_grams: weightGrams }),
     },
+  );
+}
+
+export function removeLoad(battenId: string, loadId: number) {
+  return request<RemoveResult>(
+    `/api/battens/${encodeURIComponent(battenId)}/loads/${loadId}/remove`,
+    { method: 'POST' },
   );
 }

@@ -140,7 +140,8 @@ td {
 }
 
 .correct-btn,
-.transfer-btn {
+.transfer-btn,
+.remove-btn {
   padding: 5px 14px;
   border: 1px solid #2563eb;
   border-radius: 7px;
@@ -150,18 +151,26 @@ td {
   cursor: pointer;
 }
 
-.correct-btn {
+.correct-btn,
+.transfer-btn {
   margin-right: 8px;
 }
 
+.remove-btn {
+  border-color: #b45309;
+  color: #b45309;
+}
+
 .correct-btn:disabled,
-.transfer-btn:disabled {
+.transfer-btn:disabled,
+.remove-btn:disabled {
   opacity: 0.6;
   cursor: wait;
 }
 
 .correct-panel,
-.transfer-panel {
+.transfer-panel,
+.remove-panel {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -174,8 +183,14 @@ td {
   font-size: 14px;
 }
 
+.remove-panel {
+  background: #fffbeb;
+  border-color: #fcd34d;
+}
+
 .correct-panel p,
-.transfer-panel p {
+.transfer-panel p,
+.remove-panel p {
   flex-basis: 100%;
   margin: 0;
 }
@@ -189,7 +204,8 @@ td {
 }
 
 .confirm-correct,
-.confirm-transfer {
+.confirm-transfer,
+.confirm-remove {
   padding: 7px 16px;
   border: none;
   border-radius: 8px;
@@ -199,8 +215,13 @@ td {
   cursor: pointer;
 }
 
+.confirm-remove {
+  background: #b45309;
+}
+
 .cancel-correct,
-.cancel-transfer {
+.cancel-transfer,
+.cancel-remove {
   padding: 7px 16px;
   border: 1px solid #cbd2d9;
   border-radius: 8px;
@@ -213,7 +234,9 @@ td {
 .confirm-correct:disabled,
 .cancel-correct:disabled,
 .confirm-transfer:disabled,
-.cancel-transfer:disabled {
+.cancel-transfer:disabled,
+.confirm-remove:disabled,
+.cancel-remove:disabled {
   opacity: 0.6;
   cursor: wait;
 }

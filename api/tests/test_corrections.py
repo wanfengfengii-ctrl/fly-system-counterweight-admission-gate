@@ -187,7 +187,8 @@ def test_concurrent_correct_and_transfer_leave_consistent_ownership_and_capacity
 ):
     """修正与转移并发：同一吊杆行锁串行裁决，归属与容量最终一致。
 
-    G-01 挂 CW-A 5000 + CW-FIX 20000（余 5000），G-02 挂 CW-B 30000（余 20000）：
+    G-01 挂 CW-A 5000 + CW-FIX 20000（余 5000），G-02 挂 CW-B 20000 + CW-C 10000
+    （共 30000，余 20000；单片不得超过 25000 克，故 30000 克拆成两片登记）：
       T1: 修正 CW-FIX 20000 → 25000（G-01 恰好满载 30000，允许）
       T2: 转移 CW-FIX G-01 → G-02（按旧重量恰好满载 50000，允许；
           按新重量 30000+25000=55000 超载，必须拒绝）
@@ -196,7 +197,10 @@ def test_concurrent_correct_and_transfer_leave_consistent_ownership_and_capacity
     """
     load_piece(base_url, "G-01", "CW-A", 5000)
     load_piece(base_url, "G-01", "CW-FIX", 20000)
-    load_piece(base_url, "G-02", "CW-B", 30000)
+    # 单片上限 25000 克：30000 克用两片合法配重片凑出，确保 G-02 余 20000 克
+    rb1 = load_piece(base_url, "G-02", "CW-B", 20000)
+    rb2 = load_piece(base_url, "G-02", "CW-C", 10000)
+    assert rb1.status_code == 201 and rb2.status_code == 201
     load_id = _load_id(batten_state(base_url, "G-01"), "CW-FIX")
 
     barrier = threading.Barrier(2)
@@ -232,7 +236,9 @@ def test_concurrent_correct_and_transfer_leave_consistent_ownership_and_capacity
     # 归属守恒：CW-FIX 全库恰好登记一次，只在一根杆上
     assert ("CW-FIX" in on_g01) != ("CW-FIX" in on_g02)
     assert "CW-A" in on_g01
+    # 预置在 G-02 的两片始终留杆，不参与本次裁决
     assert "CW-B" in on_g02
+    assert "CW-C" in on_g02
 
     if "CW-FIX" in on_g01:
         # 修正先生效：新重量留在源杆，转移按新重量裁决超载被拒

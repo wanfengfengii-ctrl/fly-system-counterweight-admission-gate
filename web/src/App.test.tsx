@@ -442,4 +442,134 @@ describe('吊杆配重装载页（真实接口反馈）', () => {
     expect(dst.loads[0].piece_id).toBe('CW-STALE');
     expect(dst.loads[0].weight_grams).toBe(5000);
   });
+
+  it('确认拆下：二次确认后明细消失、余量增加并展示本次释放重量', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-OFF', '20000');
+    await screen.findByRole('status');
+    await waitFor(() =>
+      expect(screen.getByRole('cell', { name: 'CW-OFF' })).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('remaining')).toHaveTextContent('10000 克');
+
+    // 第一步：点击明细行的“确认拆下”，仅弹出二次确认，尚未真正拆下
+    await user.click(screen.getByRole('button', { name: '拆下 CW-OFF' }));
+    const panel = screen.getByRole('group', { name: '拆下确认' });
+    expect(panel).toBeInTheDocument();
+    expect(panel).toHaveTextContent('CW-OFF');
+    expect(panel).toHaveTextContent('20000 克');
+    // 确认前明细仍在、容量未释放
+    expect(screen.getByRole('cell', { name: 'CW-OFF' })).toBeInTheDocument();
+    expect(screen.getByTestId('remaining')).toHaveTextContent('10000 克');
+
+    // 第二步：在确认面板中再次点击“确认拆下”
+    await user.click(screen.getByRole('button', { name: '确认拆下' }));
+
+    // 成功反馈明确给出本次释放的重量与刷新后的总重 / 余量
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('已确认从 G-01 拆下');
+    expect(status).toHaveTextContent('释放容量 20000 克');
+    expect(status).toHaveTextContent('本次释放 20000 克');
+    expect(status).toHaveTextContent('当前总重 0 克');
+    expect(status).toHaveTextContent('剩余量 30000 克');
+
+    // 在杆明细刷新后该片消失，余量回升
+    await waitFor(() =>
+      expect(screen.getByText('暂无已接纳配重片')).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole('cell', { name: 'CW-OFF' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId('total')).toHaveTextContent(/^0 克$/);
+    expect(screen.getByTestId('remaining')).toHaveTextContent(/^30000 克$/);
+
+    // 直接与数据库核对：容量已释放、明细已空
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(0);
+    expect(db.remaining_grams).toBe(30000);
+    expect(db.loads).toHaveLength(0);
+
+    // 历史唯一标识仍被占用：已拆下的标识不能再次登记
+    const reused = await fetch(`${BASE}/api/battens/G-02/loads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ piece_id: 'CW-OFF', weight_grams: 1000 }),
+    });
+    expect(reused.status).toBe(409);
+    expect((await reused.json()).reason).toBe('PIECE_ID_EXISTS');
+  });
+
+  it('拆下二次确认面板点取消：配重片保留在明细，容量不释放', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-KEEP-ON', '8000');
+    await screen.findByRole('status');
+    await waitFor(() =>
+      expect(screen.getByRole('cell', { name: 'CW-KEEP-ON' })).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: '拆下 CW-KEEP-ON' }));
+    expect(screen.getByRole('group', { name: '拆下确认' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '取消' }));
+
+    // 面板关闭，配重片仍在杆上，总重 / 余量不变
+    expect(
+      screen.queryByRole('group', { name: '拆下确认' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: 'CW-KEEP-ON' })).toBeInTheDocument();
+    expect(screen.getByTestId('total')).toHaveTextContent('8000 克');
+    expect(screen.getByTestId('remaining')).toHaveTextContent('22000 克');
+
+    const db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(8000);
+    expect(db.loads).toHaveLength(1);
+  });
+
+  it('配重片已被其他终端转移时，拆下提示当前位置已变化并重载明细', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-RM-STALE', '5000');
+    await screen.findByRole('status');
+    await waitFor(() =>
+      expect(screen.getByRole('cell', { name: 'CW-RM-STALE' })).toBeInTheDocument(),
+    );
+
+    // 另一终端先把片子转移到 G-02，页面明细随之过期
+    const before = await dbBatten('G-01');
+    const loadId = before.loads[0].load_id;
+    const moved = await fetch(
+      `${BASE}/api/battens/G-01/loads/${loadId}/transfer`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_batten_id: 'G-02' }),
+      },
+    );
+    expect(moved.status).toBe(200);
+
+    // 旧页面仍显示该片，技师照常在当前吊杆明细里确认拆下
+    await user.click(screen.getByRole('button', { name: '拆下 CW-RM-STALE' }));
+    await user.click(screen.getByRole('button', { name: '确认拆下' }));
+
+    // 并发失败反馈：当前位置已变化
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('已拒绝');
+    expect(alert).toHaveTextContent('当前位置已变化');
+
+    // 明细重新加载后与数据库一致：G-01 已空，该片在 G-02 保持原重量，
+    // 源杆容量未被错误释放
+    await waitFor(() =>
+      expect(screen.getByText('暂无已接纳配重片')).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole('cell', { name: 'CW-RM-STALE' }),
+    ).not.toBeInTheDocument();
+
+    const src = await dbBatten('G-01');
+    expect(src.loads).toHaveLength(0);
+    expect(src.total_grams).toBe(0);
+    const dst = await dbBatten('G-02');
+    expect(dst.loads).toHaveLength(1);
+    expect(dst.loads[0].piece_id).toBe('CW-RM-STALE');
+    expect(dst.loads[0].weight_grams).toBe(5000);
+    expect(dst.total_grams).toBe(5000);
+  });
 });

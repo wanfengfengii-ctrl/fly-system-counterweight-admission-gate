@@ -3,6 +3,7 @@ import {
   correctLoadWeight,
   fetchBatten,
   fetchBattens,
+  removeLoad,
   submitLoad,
   transferLoad,
 } from './api';
@@ -27,6 +28,8 @@ export default function App() {
   // 待修正重量的配重片（来自当前吊杆明细）；null 表示未进入修正流程
   const [correcting, setCorrecting] = useState<LoadItem | null>(null);
   const [correctionWeight, setCorrectionWeight] = useState('');
+  // 待拆下的配重片（来自当前吊杆明细）；null 表示未进入拆下二次确认流程
+  const [removing, setRemoving] = useState<LoadItem | null>(null);
 
   // 单调递增的刷新序号：放弃早于最新一次刷新返回的过期响应，
   // 避免上一个动作的在途拉取在新动作之后落地，把界面回滚成旧状态
@@ -52,12 +55,13 @@ export default function App() {
     void refresh(selected);
   }, [refresh, selected]);
 
-  // 切换吊杆后，上一根吊杆的待转移 / 待修正配重片不再适用于当前明细
+  // 切换吊杆后，上一根吊杆的待转移 / 待修正 / 待拆下配重片不再适用于当前明细
   useEffect(() => {
     setTransferring(null);
     setTransferTarget('');
     setCorrecting(null);
     setCorrectionWeight('');
+    setRemoving(null);
   }, [selected]);
 
   async function handleSubmit(event: FormEvent) {
@@ -94,9 +98,10 @@ export default function App() {
 
   function beginTransfer(load: LoadItem) {
     setFeedback(null);
-    // 转移与修正互斥：同一时间只针对一片配重片操作
+    // 转移、修正与拆下互斥：同一时间只针对一片配重片操作
     setCorrecting(null);
     setCorrectionWeight('');
+    setRemoving(null);
     setTransferring(load);
     // 默认目标为另一根吊杆
     setTransferTarget(battens.find((b) => b.batten_id !== selected)?.batten_id ?? '');
@@ -141,9 +146,10 @@ export default function App() {
 
   function beginCorrect(load: LoadItem) {
     setFeedback(null);
-    // 修正与转移互斥：同一时间只针对一片配重片操作
+    // 修正、转移与拆下互斥：同一时间只针对一片配重片操作
     setTransferring(null);
     setTransferTarget('');
+    setRemoving(null);
     setCorrecting(load);
     setCorrectionWeight('');
   }
@@ -151,6 +157,48 @@ export default function App() {
   function cancelCorrect() {
     setCorrecting(null);
     setCorrectionWeight('');
+  }
+
+  function beginRemove(load: LoadItem) {
+    setFeedback(null);
+    // 拆下、转移与修正互斥：同一时间只针对一片配重片操作
+    setTransferring(null);
+    setTransferTarget('');
+    setCorrecting(null);
+    setCorrectionWeight('');
+    setRemoving(load);
+  }
+
+  function cancelRemove() {
+    setRemoving(null);
+  }
+
+  async function confirmRemove() {
+    if (!removing) return;
+    setFeedback(null);
+    setSubmitting(true);
+    try {
+      const { body } = await removeLoad(selected, removing.load_id);
+      if (body.accepted) {
+        const releaseNote = body.already_removed
+          ? '本次释放 0 克（已拆下，容量未重复释放）'
+          : `本次释放 ${body.released_grams} 克`;
+        setFeedback({
+          kind: 'success',
+          text: `${body.message}；${releaseNote}：当前总重 ${body.total_grams} 克，剩余量 ${body.remaining_grams} 克`,
+        });
+      } else {
+        // 当前位置已变化（已被其他终端转移）：明细以数据库为准刷新
+        setFeedback({ kind: 'error', text: `已拒绝：${body.message}` });
+      }
+    } catch {
+      setFeedback({ kind: 'error', text: '网络错误，无法联系装载裁决服务' });
+    } finally {
+      setSubmitting(false);
+    }
+    setRemoving(null);
+    // 无论成功、重复拆下或拒绝，都刷新总重、余量与在杆明细
+    await refresh(selected);
   }
 
   async function confirmCorrect() {
@@ -316,6 +364,15 @@ export default function App() {
                       >
                         转移
                       </button>
+                      <button
+                        type="button"
+                        className="remove-btn"
+                        aria-label={`拆下 ${load.piece_id}`}
+                        onClick={() => beginRemove(load)}
+                        disabled={submitting}
+                      >
+                        确认拆下
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -390,6 +447,32 @@ export default function App() {
                 className="cancel-transfer"
                 disabled={submitting}
                 onClick={cancelTransfer}
+              >
+                取消
+              </button>
+            </div>
+          )}
+
+          {removing && (
+            <div className="remove-panel" role="group" aria-label="拆下确认">
+              <p>
+                确认从 {selected} 拆下配重片 <strong>{removing.piece_id}</strong>（
+                {removing.weight_grams} 克）？拆下后容量立即释放，但该片的标识、
+                重量、归属与登记时间仍保留备查；标识不能再次登记。
+              </p>
+              <button
+                type="button"
+                className="confirm-remove"
+                disabled={submitting}
+                onClick={() => void confirmRemove()}
+              >
+                确认拆下
+              </button>
+              <button
+                type="button"
+                className="cancel-remove"
+                disabled={submitting}
+                onClick={cancelRemove}
               >
                 取消
               </button>

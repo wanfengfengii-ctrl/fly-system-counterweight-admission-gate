@@ -1,10 +1,11 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +32,14 @@ def ensure_fixture_battens(db: Session) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # 旧数据升级：create_all 不会给已存在的表补列。若旧库的 loads 表缺少
+    # removed_at，统一补上且全部为 NULL —— 老记录一律视为仍在杆上。
+    with engine.begin() as conn:
+        columns = {col["name"] for col in inspect(conn).get_columns("loads")}
+        if "loads" in inspect(conn).get_table_names() and "removed_at" not in columns:
+            conn.execute(
+                text("ALTER TABLE loads ADD COLUMN removed_at TIMESTAMP WITH TIME ZONE")
+            )
     with SessionLocal() as db:
         ensure_fixture_battens(db)
     yield
@@ -78,10 +87,11 @@ def reject(status_code: int, reason: str, message: str, **extra) -> JSONResponse
 
 
 def batten_summary(db: Session, batten: Batten) -> dict:
+    # 容量汇总只认在杆记录（removed_at IS NULL）；已拆下的配重片不再占容量
     total = db.scalar(
-        select(func.coalesce(func.sum(Load.weight_grams), 0)).where(
-            Load.batten_id == batten.id
-        )
+        select(func.coalesce(func.sum(Load.weight_grams), 0))
+        .where(Load.batten_id == batten.id)
+        .where(Load.removed_at.is_(None))
     )
     return {
         "batten_id": batten.id,
@@ -103,7 +113,9 @@ def list_battens(db: Session = Depends(get_db)):
     for batten in battens:
         summary = batten_summary(db, batten)
         summary["load_count"] = db.scalar(
-            select(func.count(Load.id)).where(Load.batten_id == batten.id)
+            select(func.count(Load.id))
+            .where(Load.batten_id == batten.id)
+            .where(Load.removed_at.is_(None))
         )
         summaries.append(summary)
     return {"battens": summaries}
@@ -115,8 +127,12 @@ def get_batten(batten_id: str, db: Session = Depends(get_db)):
     if batten is None:
         return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {batten_id} 不存在")
     summary = batten_summary(db, batten)
+    # 在杆明细：只返回仍在该吊杆上的记录，已拆下的配重片不再出现在明细中
     loads = db.scalars(
-        select(Load).where(Load.batten_id == batten_id).order_by(Load.id)
+        select(Load)
+        .where(Load.batten_id == batten_id)
+        .where(Load.removed_at.is_(None))
+        .order_by(Load.id)
     ).all()
     summary["loads"] = [
         {
@@ -254,18 +270,45 @@ def transfer_load(
             target_batten_id=target_id,
         )
 
-    # 锁内再确认配重片归属：并发转移时后到者会看到已提交的新归属
+    # 锁内再确认配重片归属与在杆状态：并发转移 / 拆下时后到者会看到已提交的新归属
+    # 或拆下标记；只认在杆记录，已拆下的配重片不能再转移
     load = db.scalar(
-        select(Load).where(Load.id == load_id).with_for_update()
+        select(Load)
+        .where(Load.id == load_id)
+        .where(Load.removed_at.is_(None))
+        .with_for_update()
     )
     if load is None:
-        # 编号从未登记过：明确报告装载记录不存在，
-        # 不能与"已被其他终端移走"混为一谈
+        # 可能是从未登记、已被转移走、或已拆下：先看记录到底存不存在，
+        # 编号从未登记过才报 LOAD_NOT_FOUND，不能与"位置已变化"混为一谈
+        existing = db.get(Load, load_id)
+        if existing is None:
+            db.rollback()
+            return reject(
+                404,
+                "LOAD_NOT_FOUND",
+                f"装载记录 {load_id} 不存在",
+                source_batten_id=batten_id,
+                target_batten_id=target_id,
+                load_id=load_id,
+            )
+        # 归属在回滚前读出，避免回滚使对象过期后再触发查询
+        current_batten_id = existing.batten_id
         db.rollback()
+        if current_batten_id != batten_id:
+            reason_msg = (
+                f"配重片当前位置已变化：已不在源吊杆 {batten_id} 上，"
+                "可能已被其他终端转移"
+            )
+        else:
+            reason_msg = (
+                f"配重片当前位置已变化：已从吊杆 {batten_id} 拆下，"
+                "不能再转移"
+            )
         return reject(
-            404,
-            "LOAD_NOT_FOUND",
-            f"装载记录 {load_id} 不存在",
+            409,
+            "POSITION_CHANGED",
+            reason_msg,
             source_batten_id=batten_id,
             target_batten_id=target_id,
             load_id=load_id,
@@ -352,16 +395,43 @@ def correct_load_weight(
         db.rollback()
         return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {batten_id} 不存在")
 
-    # 锁内再确认配重片归属：并发转移提交后，后到者看到已提交的新归属
+    # 锁内再确认配重片归属与在杆状态：并发转移 / 拆下提交后，后到者看到已提交的
+    # 新归属或拆下标记；只认在杆记录
     load = db.scalar(
-        select(Load).where(Load.id == load_id).with_for_update()
+        select(Load)
+        .where(Load.id == load_id)
+        .where(Load.removed_at.is_(None))
+        .with_for_update()
     )
     if load is None:
+        # 从未登记报 LOAD_NOT_FOUND；已被转移走或已拆下报当前位置已变化
+        existing = db.get(Load, load_id)
+        if existing is None:
+            db.rollback()
+            return reject(
+                404,
+                "LOAD_NOT_FOUND",
+                f"装载记录 {load_id} 不存在",
+                batten_id=batten_id,
+                load_id=load_id,
+            )
+        # 归属在回滚前读出，避免回滚使对象过期后再触发查询
+        current_batten_id = existing.batten_id
         db.rollback()
+        if current_batten_id != batten_id:
+            message = (
+                f"配重片当前位置已变化：已不在吊杆 {batten_id} 上，"
+                "可能已被其他终端转移"
+            )
+        else:
+            message = (
+                f"配重片当前位置已变化：已从吊杆 {batten_id} 拆下，"
+                "不能再修正"
+            )
         return reject(
-            404,
-            "LOAD_NOT_FOUND",
-            f"装载记录 {load_id} 不存在",
+            409,
+            "POSITION_CHANGED",
+            message,
             batten_id=batten_id,
             load_id=load_id,
         )
@@ -410,6 +480,92 @@ def correct_load_weight(
         "capacity_grams": batten.capacity_grams,
         "total_grams": new_total,
         "remaining_grams": batten.capacity_grams - new_total,
+    }
+
+
+@app.post("/api/battens/{batten_id}/loads/{load_id}/remove")
+def remove_load(batten_id: str, load_id: int, db: Session = Depends(get_db)):
+    """演出拆台：确认从当前吊杆明细取下一片配重。
+
+    不删除记录，只在吊杆行锁内确认该记录仍处于在杆状态，再写入拆下时刻；
+    容量随本片重量立即释放，而配重片标识、重量、归属与最初登记时间全部
+    保留以备追溯。已被其他终端转移走时返回当前位置已变化；已拆下则幂等
+    返回明确结果，不重复释放容量。
+    """
+    # SELECT ... FOR UPDATE：与装载 / 转移 / 修正在同一吊杆行锁上排队，
+    # 并发拆下 / 转移 / 装载彼此串行，容量只按最新已提交状态释放一次
+    batten = db.scalar(
+        select(Batten).where(Batten.id == batten_id).with_for_update()
+    )
+    if batten is None:
+        db.rollback()
+        return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {batten_id} 不存在")
+
+    # 锁内取出完整记录（不过滤在杆状态），再依次裁决归属与是否已拆下
+    load = db.scalar(select(Load).where(Load.id == load_id).with_for_update())
+    if load is None:
+        db.rollback()
+        return reject(
+            404,
+            "LOAD_NOT_FOUND",
+            f"装载记录 {load_id} 不存在",
+            batten_id=batten_id,
+            load_id=load_id,
+        )
+    if load.batten_id != batten_id:
+        db.rollback()
+        return reject(
+            409,
+            "POSITION_CHANGED",
+            f"配重片当前位置已变化：已不在吊杆 {batten_id} 上，"
+            "可能已被其他终端转移",
+            batten_id=batten_id,
+            load_id=load_id,
+        )
+    if load.removed_at is not None:
+        # 已拆下：幂等返回明确结果，绝不二次写入、不重复释放容量。
+        # 汇总仍在锁内读取，保证与本次裁决同一快照；回滚仅释放行锁。
+        summary = batten_summary(db, batten)
+        removed_at_iso = load.removed_at.isoformat()
+        db.rollback()
+        return {
+            "accepted": True,
+            "message": (
+                f"配重片 {load.piece_id} 已处于拆下状态，无需重复拆下，"
+                "容量未重复释放"
+            ),
+            "already_removed": True,
+            "load_id": load.id,
+            "piece_id": load.piece_id,
+            "weight_grams": load.weight_grams,
+            "released_grams": 0,
+            "removed_at": removed_at_iso,
+            "batten_id": batten_id,
+            **summary,
+        }
+
+    # 只写拆下时刻：piece_id / weight_grams / batten_id / created_at 原样保留
+    released_grams = load.weight_grams
+    removed_at = datetime.now(timezone.utc)
+    load.removed_at = removed_at
+    db.commit()
+
+    # 汇总只认在杆记录：本片已排除，总重立即下降、余量立即回升
+    summary = batten_summary(db, batten)
+    return {
+        "accepted": True,
+        "message": (
+            f"配重片 {load.piece_id} 已确认从 {batten_id} 拆下，"
+            f"释放容量 {released_grams} 克"
+        ),
+        "already_removed": False,
+        "load_id": load.id,
+        "piece_id": load.piece_id,
+        "weight_grams": released_grams,
+        "released_grams": released_grams,
+        "removed_at": removed_at.isoformat(),
+        "batten_id": batten_id,
+        **summary,
     }
 
 
