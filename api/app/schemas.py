@@ -34,6 +34,17 @@ class TransferCreate(BaseModel):
     # 转移目标吊杆编号；与源杆相同、不存在由接口在锁内明确拒绝
     target_batten_id: str = Field(min_length=1, max_length=32)
 
+    @field_validator("target_batten_id")
+    @classmethod
+    def normalize_target_batten_id(cls, value: str) -> str:
+        # 与配重片标识同一套规整：首尾空白不参与编号；仅含空白
+        # （空格、制表、换行等）的目标不是合法编号，必须在参数校验阶段
+        # 明确拒绝，不能落到锁内被误报为吊杆不存在
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("目标吊杆编号不能为空白")
+        return normalized
+
 
 class WeightCorrect(BaseModel):
     # 修正后的单片重量：严格整数，字符串 "100"、小数 100.0 等一律拒绝

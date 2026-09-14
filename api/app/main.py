@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -56,15 +57,23 @@ app.add_middleware(
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    # 路径中的装载编号不是数字（如 /loads/abc/remove）：loc 落在 path/load_id 上，
-    # 与请求体无关，不能套用配重标识 / 重量提示；
+    # 路径中的装载编号不合法（如 /loads/abc/remove、/loads/-1/transfer）：
+    # loc 落在 path/load_id 上，与请求体无关，不能套用配重标识 / 重量提示。
+    # 非数字报"必须是数字"；能解析成数字但不是正整数（负数、零）报
+    # "必须是正整数"——负数编号绝不能落到库里被误报为记录不存在；
     # 转移接口的请求体只有目标参数 target_batten_id：缺 body、缺字段、空串、
-    # 非字符串等校验失败（loc 落在 body / target_batten_id 上）都说明
+    # 仅含空白、非字符串等校验失败（loc 落在 body / target_batten_id 上）都说明
     # 转移目标参数不合法，同样不能套用装载接口的提示；
     # 修正接口的请求体只有新重量一个参数，同样单独给出提示
     locs = {loc for err in exc.errors() for loc in err.get("loc", ())}
     if "load_id" in locs:
-        message = "请求格式不合法：装载编号必须是数字"
+        if any(
+            err.get("type") == "greater_than" and "load_id" in err.get("loc", ())
+            for err in exc.errors()
+        ):
+            message = "请求格式不合法：装载编号必须是正整数"
+        else:
+            message = "请求格式不合法：装载编号必须是数字"
     elif request.url.path.endswith("/transfer") and (
         "target_batten_id" in locs or "body" in locs
     ):
@@ -242,7 +251,9 @@ def _lock_battens_in_fixed_order(db: Session, batten_ids: list[str]) -> dict[str
 @app.post("/api/battens/{batten_id}/loads/{load_id}/transfer")
 def transfer_load(
     batten_id: str,
-    load_id: int,
+    # 装载编号必须是正整数：负数 / 零在参数校验阶段 422 拒绝，
+    # 不会落到库里被误报为记录不存在
+    load_id: Annotated[int, Path(gt=0)],
     payload: TransferCreate,
     db: Session = Depends(get_db),
 ):
@@ -370,7 +381,9 @@ def transfer_load(
 @app.post("/api/battens/{batten_id}/loads/{load_id}/correct")
 def correct_load_weight(
     batten_id: str,
-    load_id: int,
+    # 装载编号必须是正整数：负数 / 零在参数校验阶段 422 拒绝，
+    # 不会落到库里被误报为记录不存在
+    load_id: Annotated[int, Path(gt=0)],
     payload: WeightCorrect,
     db: Session = Depends(get_db),
 ):
@@ -488,7 +501,13 @@ def correct_load_weight(
 
 
 @app.post("/api/battens/{batten_id}/loads/{load_id}/remove")
-def remove_load(batten_id: str, load_id: int, db: Session = Depends(get_db)):
+def remove_load(
+    batten_id: str,
+    # 装载编号必须是正整数：负数 / 零在参数校验阶段 422 拒绝，
+    # 不会落到库里被误报为记录不存在
+    load_id: Annotated[int, Path(gt=0)],
+    db: Session = Depends(get_db),
+):
     """演出拆台：确认从当前吊杆明细取下一片配重。
 
     不删除记录，只在吊杆行锁内确认该记录仍处于在杆状态，再写入拆下时刻；
