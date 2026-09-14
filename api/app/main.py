@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
 from .models import Batten, Load
-from .schemas import LoadCreate, TransferCreate
+from .schemas import LoadCreate, TransferCreate, WeightCorrect
 
 MIN_WEIGHT_GRAMS = 100
 MAX_WEIGHT_GRAMS = 25000
@@ -47,14 +47,17 @@ app.add_middleware(
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    # 转移接口的请求体只有目标吊杆一个参数：缺 body、缺字段、空串、
+    # 转移接口的请求体只有目标参数 target_batten_id：缺 body、缺字段、空串、
     # 非字符串等校验失败（loc 落在 body / target_batten_id 上）都说明
-    # 转移目标参数不合法，不能套用装载接口的配重标识 / 重量提示
+    # 转移目标参数不合法，不能套用装载接口的配重标识 / 重量提示；
+    # 修正接口的请求体只有新重量一个参数，同样单独给出提示
     locs = {loc for err in exc.errors() for loc in err.get("loc", ())}
     if request.url.path.endswith("/transfer") and (
         "target_batten_id" in locs or "body" in locs
     ):
         message = "请求格式不合法：转移目标参数不合法，目标吊杆编号必须是非空字符串"
+    elif request.url.path.endswith("/correct"):
+        message = "请求格式不合法：修正重量必须是整数克数"
     else:
         message = "请求格式不合法：配重片标识不能为空，重量必须是整数克数"
     return JSONResponse(
@@ -314,6 +317,99 @@ def transfer_load(
         "target_batten_id": target_id,
         "source": source_summary,
         "target": target_summary,
+    }
+
+
+@app.post("/api/battens/{batten_id}/loads/{load_id}/correct")
+def correct_load_weight(
+    batten_id: str,
+    load_id: int,
+    payload: WeightCorrect,
+    db: Session = Depends(get_db),
+):
+    """修正已登记配重片的标称重量。
+
+    只更新现有装载记录的 weight_grams，不删除、不重新登记，
+    配重片标识与最初登记时间保留。与装载、转移同一套串行化：
+    同一事务内先锁定路径指定的吊杆，再确认装载记录仍归属于该杆，
+    随后以新旧重量差重新核算容量（恰好达到核定值允许写入）。
+    任一校验失败都回滚，数据库中的原重量保持不变。
+    """
+    if not MIN_WEIGHT_GRAMS <= payload.weight_grams <= MAX_WEIGHT_GRAMS:
+        return reject(
+            422,
+            "INVALID_WEIGHT",
+            f"单片重量必须在 {MIN_WEIGHT_GRAMS}～{MAX_WEIGHT_GRAMS} 克之间，"
+            f"收到 {payload.weight_grams} 克",
+        )
+
+    # SELECT ... FOR UPDATE：与装载、转移在同一吊杆行锁上排队，
+    # 并发修正 / 转移 / 装载彼此串行，按已提交的最新总重裁决
+    batten = db.scalar(
+        select(Batten).where(Batten.id == batten_id).with_for_update()
+    )
+    if batten is None:
+        db.rollback()
+        return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {batten_id} 不存在")
+
+    # 锁内再确认配重片归属：并发转移提交后，后到者看到已提交的新归属
+    load = db.scalar(
+        select(Load).where(Load.id == load_id).with_for_update()
+    )
+    if load is None:
+        db.rollback()
+        return reject(
+            404,
+            "LOAD_NOT_FOUND",
+            f"装载记录 {load_id} 不存在",
+            batten_id=batten_id,
+            load_id=load_id,
+        )
+    if load.batten_id != batten_id:
+        db.rollback()
+        return reject(
+            409,
+            "POSITION_CHANGED",
+            f"配重片当前位置已变化：已不在吊杆 {batten_id} 上，"
+            "可能已被其他终端转移",
+            batten_id=batten_id,
+            load_id=load_id,
+        )
+
+    summary = batten_summary(db, batten)
+    # 以新旧重量差重新核算容量：新总重 = 当前总重 - 原重量 + 新重量
+    new_total = summary["total_grams"] - load.weight_grams + payload.weight_grams
+    if new_total > batten.capacity_grams:
+        db.rollback()
+        return reject(
+            409,
+            "OVER_CAPACITY",
+            f"吊杆 {batten_id} 当前总重 {summary['total_grams']} 克，"
+            f"配重片 {load.piece_id} 由 {load.weight_grams} 克修正为 "
+            f"{payload.weight_grams} 克后合计 {new_total} 克 "
+            f"超出核定 {batten.capacity_grams} 克",
+            **summary,
+        )
+
+    # 只改重量：piece_id 与 created_at 原样保留
+    previous_weight = load.weight_grams
+    load.weight_grams = payload.weight_grams
+    db.commit()
+
+    return {
+        "accepted": True,
+        "message": (
+            f"配重片 {load.piece_id} 重量已从 {previous_weight} 克"
+            f"修正为 {payload.weight_grams} 克"
+        ),
+        "load_id": load.id,
+        "piece_id": load.piece_id,
+        "previous_weight_grams": previous_weight,
+        "weight_grams": payload.weight_grams,
+        "batten_id": batten_id,
+        "capacity_grams": batten.capacity_grams,
+        "total_grams": new_total,
+        "remaining_grams": batten.capacity_grams - new_total,
     }
 
 

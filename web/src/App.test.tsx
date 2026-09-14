@@ -325,4 +325,121 @@ describe('吊杆配重装载页（真实接口反馈）', () => {
     expect(dst.total_grams).toBe(35000);
     expect(dst.remaining_grams).toBe(15000);
   });
+
+  it('页面修正重量：超载被拒绝并提示，合法修正成功后总重 / 余量 / 明细刷新', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-FIX-A', '20000');
+    await screen.findByRole('status');
+    await submitPiece(user, 'CW-FIX-B', '10000');
+    // G-01 恰好满载 30000 克
+    await waitFor(() =>
+      expect(screen.getByTestId('total')).toHaveTextContent('30000 克'),
+    );
+    expect(screen.getByTestId('remaining')).toHaveTextContent(/^0 克$/);
+
+    // 记录 CW-FIX-B 的原始登记信息，用于核对修正后标识与登记时间保留
+    const before = await dbBatten('G-01');
+    const fixBefore = before.loads.find(
+      (l: { piece_id: string }) => l.piece_id === 'CW-FIX-B',
+    );
+    expect(fixBefore).toBeTruthy();
+
+    // 超载修正：CW-FIX-A 20000 → 20001，合计 30001 超出核定，必须拒绝
+    await user.click(screen.getByRole('button', { name: '修正重量 CW-FIX-A' }));
+    const panel = screen.getByRole('group', { name: '修正重量' });
+    expect(panel).toHaveTextContent('当前 20000 克');
+    await user.type(screen.getByLabelText('新重量（克）'), '20001');
+    await user.click(screen.getByRole('button', { name: '确认修正' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('已拒绝');
+    expect(alert).toHaveTextContent('超出核定');
+
+    // 拒绝后页面与数据库都保持原重量
+    await waitFor(() =>
+      expect(screen.getByTestId('total')).toHaveTextContent('30000 克'),
+    );
+    let db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(30000);
+    expect(
+      db.loads.find((l: { piece_id: string }) => l.piece_id === 'CW-FIX-A')
+        .weight_grams,
+    ).toBe(20000);
+
+    // 合法修正：CW-FIX-B 10000 → 5000，总重降至 25000 克
+    await user.click(screen.getByRole('button', { name: '修正重量 CW-FIX-B' }));
+    await user.type(screen.getByLabelText('新重量（克）'), '5000');
+    await user.click(screen.getByRole('button', { name: '确认修正' }));
+
+    // 明确展示修正结果：新旧重量与刷新后的总重 / 余量
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('已从 10000 克修正为 5000 克');
+    expect(status).toHaveTextContent('当前总重 25000 克');
+    expect(status).toHaveTextContent('剩余量 5000 克');
+
+    // 页面重新拉取接口：总重、余量与明细行都刷新
+    await waitFor(() =>
+      expect(screen.getByTestId('total')).toHaveTextContent('25000 克'),
+    );
+    expect(screen.getByTestId('remaining')).toHaveTextContent('5000 克');
+    const row = screen.getByRole('row', { name: /CW-FIX-B/ });
+    expect(within(row).getByText('5000')).toBeInTheDocument();
+
+    // 与数据库核对：同一笔记录只改了重量，标识与最初登记时间保留
+    db = await dbBatten('G-01');
+    expect(db.total_grams).toBe(25000);
+    expect(db.remaining_grams).toBe(5000);
+    const fixAfter = db.loads.find(
+      (l: { piece_id: string }) => l.piece_id === 'CW-FIX-B',
+    );
+    expect(fixAfter.load_id).toBe(fixBefore.load_id);
+    expect(fixAfter.weight_grams).toBe(5000);
+    expect(fixAfter.created_at).toBe(fixBefore.created_at);
+  });
+
+  it('配重片已被其他终端转移时，修正提示当前位置已变化并重新加载明细', async () => {
+    const user = await renderLoaded();
+    await submitPiece(user, 'CW-STALE', '5000');
+    await screen.findByRole('status');
+    await waitFor(() =>
+      expect(screen.getByRole('cell', { name: 'CW-STALE' })).toBeInTheDocument(),
+    );
+
+    // 另一终端直接把片子转移到 G-02，页面明细随之过期
+    const before = await dbBatten('G-01');
+    const loadId = before.loads[0].load_id;
+    const moved = await fetch(
+      `${BASE}/api/battens/G-01/loads/${loadId}/transfer`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_batten_id: 'G-02' }),
+      },
+    );
+    expect(moved.status).toBe(200);
+
+    // 旧页面仍显示该片，技师照常在当前吊杆明细里提交修正
+    await user.click(screen.getByRole('button', { name: '修正重量 CW-STALE' }));
+    await user.type(screen.getByLabelText('新重量（克）'), '8000');
+    await user.click(screen.getByRole('button', { name: '确认修正' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('已拒绝');
+    expect(alert).toHaveTextContent('当前位置已变化');
+
+    // 明细重新加载后与数据库一致：G-01 已空，该片在 G-02 保持原重量
+    await waitFor(() =>
+      expect(screen.getByText('暂无已接纳配重片')).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole('cell', { name: 'CW-STALE' }),
+    ).not.toBeInTheDocument();
+
+    const src = await dbBatten('G-01');
+    expect(src.loads).toHaveLength(0);
+    const dst = await dbBatten('G-02');
+    expect(dst.loads).toHaveLength(1);
+    expect(dst.loads[0].piece_id).toBe('CW-STALE');
+    expect(dst.loads[0].weight_grams).toBe(5000);
+  });
 });
