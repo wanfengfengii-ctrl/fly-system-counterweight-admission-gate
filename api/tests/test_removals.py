@@ -301,6 +301,17 @@ def test_remove_unknown_batten_or_load_is_rejected(base_url):
     assert resp.json()["reason"] == "LOAD_NOT_FOUND"
 
 
+def test_remove_with_non_numeric_load_id_reports_invalid_load_id(base_url):
+    """装载编号不是数字：必须说明装载编号不合法，而非误报配重标识 / 重量有误。"""
+    resp = remove(base_url, "G-01", "abc")
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "INVALID_INPUT"
+    assert "装载编号" in body["message"]
+    assert "配重片标识" not in body["message"]
+
+
 def test_legacy_rows_without_removed_at_are_treated_as_on_rod(base_url):
     """旧数据升级：没有 removed_at 的历史记录统一视为在杆，可正常拆下并释放容量。"""
     import psycopg2

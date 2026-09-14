@@ -114,6 +114,56 @@ def test_piece_id_is_unique_across_all_battens(base_url):
     assert batten_state(base_url, "G-02")["loads"] == []
 
 
+def test_blank_piece_id_is_rejected(base_url):
+    """仅含空白（空格、制表、换行）的标识必须明确拒绝，不产生任何记录。"""
+    for blank_id in ("   ", "\t", " \n ", "　"):  # 含全角空格
+        resp = load_piece(base_url, "G-01", blank_id, 5000)
+        assert resp.status_code == 422, f"空白标识 {blank_id!r} 未被拒绝: {resp.text}"
+        body = resp.json()
+        assert body["accepted"] is False
+        assert body["reason"] == "INVALID_INPUT"
+
+    # 全部被拒后吊杆必须仍是空的：失败请求不落库
+    state = batten_state(base_url, "G-01")
+    assert state["total_grams"] == 0
+    assert state["loads"] == []
+
+
+def test_piece_id_surrounding_whitespace_is_normalized(base_url):
+    """首尾空白不参与标识：带空格变体与正常标识是同一标识，判定已被占用。"""
+    assert load_piece(base_url, "G-01", "CW-TRIM", 5000).status_code == 201
+    for variant in (" CW-TRIM", "CW-TRIM ", "  CW-TRIM  ", "\tCW-TRIM\n"):
+        resp = load_piece(base_url, "G-02", variant, 5000)
+        assert resp.status_code == 409, f"变体 {variant!r} 未判重: {resp.text}"
+        assert resp.json()["reason"] == "PIECE_ID_EXISTS"
+
+    # 全库只有第一笔记录，变体不产生第二条
+    assert [l["piece_id"] for l in batten_state(base_url, "G-01")["loads"]] == ["CW-TRIM"]
+    assert batten_state(base_url, "G-02")["loads"] == []
+
+    # 反向同样成立：先登记带空白的，落库的是规整后的标识
+    assert load_piece(base_url, "G-02", "  CW-PAD  ", 1000).status_code == 201
+    assert [l["piece_id"] for l in batten_state(base_url, "G-02")["loads"]] == ["CW-PAD"]
+    again = load_piece(base_url, "G-01", "CW-PAD", 1000)
+    assert again.status_code == 409
+    assert again.json()["reason"] == "PIECE_ID_EXISTS"
+
+
+def test_piece_id_with_invisible_chars_is_rejected(base_url):
+    """含换行等不可见字符的标识必须拒绝，明细中不得返回异常文本。"""
+    for bad_id in ("CW\n01", "CW\r\n01", "CW\t01", "CW​01", "\x07CW"):
+        resp = load_piece(base_url, "G-01", bad_id, 5000)
+        assert resp.status_code == 422, f"标识 {bad_id!r} 未被拒绝: {resp.text}"
+        body = resp.json()
+        assert body["accepted"] is False
+        assert body["reason"] == "INVALID_INPUT"
+
+    # 全部被拒后吊杆必须仍是空的：明细不会返回异常文本
+    state = batten_state(base_url, "G-01")
+    assert state["total_grams"] == 0
+    assert state["loads"] == []
+
+
 def test_unknown_batten_is_rejected(base_url):
     resp = load_piece(base_url, "G-99", "CW-GHOST", 1000)
     assert resp.status_code == 404

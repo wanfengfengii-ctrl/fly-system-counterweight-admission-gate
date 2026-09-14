@@ -56,19 +56,23 @@ app.add_middleware(
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
+    # 路径中的装载编号不是数字（如 /loads/abc/remove）：loc 落在 path/load_id 上，
+    # 与请求体无关，不能套用配重标识 / 重量提示；
     # 转移接口的请求体只有目标参数 target_batten_id：缺 body、缺字段、空串、
     # 非字符串等校验失败（loc 落在 body / target_batten_id 上）都说明
-    # 转移目标参数不合法，不能套用装载接口的配重标识 / 重量提示；
+    # 转移目标参数不合法，同样不能套用装载接口的提示；
     # 修正接口的请求体只有新重量一个参数，同样单独给出提示
     locs = {loc for err in exc.errors() for loc in err.get("loc", ())}
-    if request.url.path.endswith("/transfer") and (
+    if "load_id" in locs:
+        message = "请求格式不合法：装载编号必须是数字"
+    elif request.url.path.endswith("/transfer") and (
         "target_batten_id" in locs or "body" in locs
     ):
         message = "请求格式不合法：转移目标参数不合法，目标吊杆编号必须是非空字符串"
     elif request.url.path.endswith("/correct"):
         message = "请求格式不合法：修正重量必须是整数克数"
     else:
-        message = "请求格式不合法：配重片标识不能为空，重量必须是整数克数"
+        message = "请求格式不合法：配重片标识不能为空且不得包含不可见字符，重量必须是整数克数"
     return JSONResponse(
         status_code=422,
         content={
