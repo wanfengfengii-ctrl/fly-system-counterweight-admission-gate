@@ -56,7 +56,7 @@ WEB_PORT=9000 API_PORT=9001 docker compose up --build
 拒绝响应均带 `accepted: false` 与 `reason`：
 `INVALID_WEIGHT`（422）、`INVALID_INPUT`（422）、`SAME_BATTEN`（422）、
 `PIECE_ID_EXISTS`（409）、`OVER_CAPACITY`（409）、`POSITION_CHANGED`（409）、
-`BATTEN_NOT_FOUND`（404）。
+`BATTEN_NOT_FOUND`（404）、`LOAD_NOT_FOUND`（404）。
 
 ## 测试（均为真实接口 / 真实数据库，无假接口）
 

@@ -46,13 +46,23 @@ app.add_middleware(
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_error_handler(_: Request, __: RequestValidationError):
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    # 转移接口的请求体只有目标吊杆一个参数：缺 body、缺字段、空串、
+    # 非字符串等校验失败（loc 落在 body / target_batten_id 上）都说明
+    # 转移目标参数不合法，不能套用装载接口的配重标识 / 重量提示
+    locs = {loc for err in exc.errors() for loc in err.get("loc", ())}
+    if request.url.path.endswith("/transfer") and (
+        "target_batten_id" in locs or "body" in locs
+    ):
+        message = "请求格式不合法：转移目标参数不合法，目标吊杆编号必须是非空字符串"
+    else:
+        message = "请求格式不合法：配重片标识不能为空，重量必须是整数克数"
     return JSONResponse(
         status_code=422,
         content={
             "accepted": False,
             "reason": "INVALID_INPUT",
-            "message": "请求格式不合法：配重片标识不能为空，重量必须是整数克数",
+            "message": message,
         },
     )
 
@@ -220,14 +230,6 @@ def transfer_load(
     源杆并校验目标余量，任一条件不满足则回滚，数据库保持原归属。
     """
     target_id = payload.target_batten_id
-    if target_id == batten_id:
-        return reject(
-            422,
-            "SAME_BATTEN",
-            f"目标吊杆不能与源吊杆 {batten_id} 相同",
-            source_batten_id=batten_id,
-            target_batten_id=target_id,
-        )
 
     locked = _lock_battens_in_fixed_order(db, [batten_id, target_id])
     source = locked.get(batten_id)
@@ -237,11 +239,35 @@ def transfer_load(
         db.rollback()
         return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {missing} 不存在")
 
+    # 同杆判定放在存在性之后：源、目标填了同一个不存在的吊杆时，
+    # 应明确报告吊杆不存在，而不是误报两杆相同
+    if target_id == batten_id:
+        db.rollback()  # 拒绝请求同时释放行锁
+        return reject(
+            422,
+            "SAME_BATTEN",
+            f"目标吊杆不能与源吊杆 {batten_id} 相同",
+            source_batten_id=batten_id,
+            target_batten_id=target_id,
+        )
+
     # 锁内再确认配重片归属：并发转移时后到者会看到已提交的新归属
     load = db.scalar(
         select(Load).where(Load.id == load_id).with_for_update()
     )
-    if load is None or load.batten_id != batten_id:
+    if load is None:
+        # 编号从未登记过：明确报告装载记录不存在，
+        # 不能与"已被其他终端移走"混为一谈
+        db.rollback()
+        return reject(
+            404,
+            "LOAD_NOT_FOUND",
+            f"装载记录 {load_id} 不存在",
+            source_batten_id=batten_id,
+            target_batten_id=target_id,
+            load_id=load_id,
+        )
+    if load.batten_id != batten_id:
         db.rollback()
         return reject(
             409,
