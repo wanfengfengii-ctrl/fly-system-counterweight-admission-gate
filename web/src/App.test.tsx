@@ -573,3 +573,105 @@ describe('吊杆配重装载页（真实接口反馈）', () => {
     expect(dst.total_grams).toBe(5000);
   });
 });
+
+describe('吊杆日检（真实接口反馈）', () => {
+  // 与页面 todayStr() 同一口径的本地营业日期
+  function localTodayStr(): string {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}-${mm}-${dd}`;
+  }
+
+  it('异常日检提交后展示服务端结论，历史视图与刷新后均来自数据库', async () => {
+    const user = await renderLoaded();
+
+    // 默认日检吊杆 G-01、默认营业日期今天；把钢丝绳勾选为异常并填写说明
+    await user.click(screen.getByLabelText('钢丝绳正常'));
+    await user.type(screen.getByLabelText('异常说明'), '钢丝绳发现断丝，需更换');
+    await user.click(screen.getByRole('button', { name: '提交日检' }));
+
+    // 成功反馈给出服务端判定的结论（需处理），而非页面自行判定
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('日检已归档');
+    expect(status).toHaveTextContent('需处理');
+
+    // 结果区展示结论、检查明细与记录时间
+    const result = screen.getByRole('region', { name: '日检结果' });
+    expect(result).toHaveTextContent('需处理');
+    expect(result).toHaveTextContent('制动器：正常');
+    expect(result).toHaveTextContent('钢丝绳：异常');
+    expect(result).toHaveTextContent('限位装置：正常');
+    expect(result).toHaveTextContent('钢丝绳发现断丝，需更换');
+    expect(result).toHaveTextContent('记录时间：');
+
+    // 历史视图出现该记录，结论来自服务端
+    const history = screen.getByRole('region', { name: '日检记录' });
+    await waitFor(() =>
+      expect(history).toHaveTextContent('钢丝绳发现断丝，需更换'),
+    );
+    expect(history).toHaveTextContent('需处理');
+    expect(history).toHaveTextContent(localTodayStr());
+
+    // 直接与数据库核对：结论由服务端判定为需处理，明细与说明已归档
+    const res = await fetch(`${BASE}/api/battens/G-01/inspections`);
+    expect(res.ok).toBe(true);
+    const db = await res.json();
+    expect(db.inspections).toHaveLength(1);
+    expect(db.inspections[0].inspection_date).toBe(localTodayStr());
+    expect(db.inspections[0].conclusion).toBe('NEEDS_ATTENTION');
+    expect(db.inspections[0].conclusion_label).toBe('需处理');
+    expect(db.inspections[0].brake_ok).toBe(true);
+    expect(db.inspections[0].rope_ok).toBe(false);
+    expect(db.inspections[0].limit_ok).toBe(true);
+    expect(db.inspections[0].abnormality_note).toBe('钢丝绳发现断丝，需更换');
+    expect(db.inspections[0].created_at).toBeTruthy();
+
+    // 模拟刷新：全新渲染，历史记录仍来自数据库
+    cleanup();
+    render(<App />);
+    const historyAfter = await screen.findByRole('region', { name: '日检记录' });
+    await waitFor(() =>
+      expect(historyAfter).toHaveTextContent('钢丝绳发现断丝，需更换'),
+    );
+    expect(historyAfter).toHaveTextContent('需处理');
+    expect(historyAfter).toHaveTextContent(localTodayStr());
+  });
+
+  it('任一项异常而说明为空时页面预检拦截，不产生巡检记录', async () => {
+    const user = await renderLoaded();
+
+    await user.click(screen.getByLabelText('制动器正常'));
+    // 不填异常说明直接提交
+    await user.click(screen.getByRole('button', { name: '提交日检' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('异常说明不能为空');
+
+    // 数据库中没有留下任何巡检记录
+    const res = await fetch(`${BASE}/api/battens/G-01/inspections`);
+    const db = await res.json();
+    expect(db.inspections).toHaveLength(0);
+  });
+
+  it('同一吊杆同一营业日期重复提交时展示已完成提示', async () => {
+    const user = await renderLoaded();
+
+    // 第一次提交：三项全部正常
+    await user.click(screen.getByRole('button', { name: '提交日检' }));
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('合格');
+
+    // 紧接着对同一吊杆同一营业日期再次提交：服务端返回已完成提示
+    await user.click(screen.getByRole('button', { name: '提交日检' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('已拒绝');
+    expect(alert).toHaveTextContent('已完成');
+
+    // 数据库中仍只有第一次的合格记录
+    const res = await fetch(`${BASE}/api/battens/G-01/inspections`);
+    const db = await res.json();
+    expect(db.inspections).toHaveLength(1);
+    expect(db.inspections[0].conclusion).toBe('PASS');
+  });
+});

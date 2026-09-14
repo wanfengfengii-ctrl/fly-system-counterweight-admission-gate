@@ -240,3 +240,97 @@ td {
   opacity: 0.6;
   cursor: wait;
 }
+
+.inspection {
+  margin-top: 20px;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid #e2e6eb;
+  border-radius: 10px;
+}
+
+.inspection h2 {
+  margin-top: 0;
+  font-size: 18px;
+}
+
+.inspection-form {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 10px 12px;
+  align-items: center;
+}
+
+.inspection-form input,
+.inspection-form select,
+.inspection-form textarea {
+  padding: 8px 10px;
+  border: 1px solid #cbd2d9;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.inspection-form button {
+  grid-column: 2;
+  padding: 9px 0;
+  border: none;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.inspection-form button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.checks-label {
+  font-size: 14px;
+}
+
+.checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+
+.checks .check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.inspection-result {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.inspection-result h3,
+.inspection-history h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.inspection-result p {
+  margin: 6px 0;
+}
+
+.check-results {
+  display: flex;
+  gap: 18px;
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspection-history {
+  margin-top: 16px;
+}

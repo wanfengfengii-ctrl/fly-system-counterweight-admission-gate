@@ -71,3 +71,40 @@ export interface RemoveResult {
   total_grams?: number;
   remaining_grams?: number;
 }
+
+// 日检结论：只能由服务端判定（PASS 合格 / NEEDS_ATTENTION 需处理）
+export type InspectionConclusion = 'PASS' | 'NEEDS_ATTENTION';
+
+export interface InspectionRecord {
+  inspection_id: number;
+  batten_id: string;
+  inspection_date: string;
+  brake_ok: boolean;
+  rope_ok: boolean;
+  limit_ok: boolean;
+  abnormality_note: string | null;
+  conclusion: InspectionConclusion;
+  conclusion_label: string;
+  created_at: string | null;
+}
+
+// 日检提交体：只含检查事实，没有结论字段
+export interface InspectionSubmission {
+  inspection_date: string;
+  brake_ok: boolean;
+  rope_ok: boolean;
+  limit_ok: boolean;
+  abnormality_note: string | null;
+}
+
+export interface InspectionResult {
+  accepted: boolean;
+  reason?: string;
+  message: string;
+  inspection?: InspectionRecord;
+}
+
+export interface InspectionList {
+  batten_id: string;
+  inspections: InspectionRecord[];
+}

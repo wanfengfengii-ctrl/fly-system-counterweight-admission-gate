@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Path, Request
@@ -11,12 +11,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import Batten, Load
-from .schemas import LoadCreate, TransferCreate, WeightCorrect
+from .models import Batten, Inspection, Load
+from .schemas import InspectionCreate, LoadCreate, TransferCreate, WeightCorrect
 
 MIN_WEIGHT_GRAMS = 100
 MAX_WEIGHT_GRAMS = 25000
 FIXTURE_BATTENS = {"G-01": 30000, "G-02": 50000}
+
+# 日检结论：只能由服务端根据三项检查结果判定，客户端不能指定
+CONCLUSION_PASS = "PASS"
+CONCLUSION_NEEDS_ATTENTION = "NEEDS_ATTENTION"
+CONCLUSION_LABELS = {
+    CONCLUSION_PASS: "合格",
+    CONCLUSION_NEEDS_ATTENTION: "需处理",
+}
 
 
 def ensure_fixture_battens(db: Session) -> None:
@@ -80,6 +88,9 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
         message = "请求格式不合法：转移目标参数不合法，目标吊杆编号必须是非空字符串"
     elif request.url.path.endswith("/correct"):
         message = "请求格式不合法：修正重量必须是整数克数"
+    elif request.url.path.endswith("/inspections"):
+        # 日检接口的请求体校验失败：日期格式错误、检查项非布尔、说明超长等
+        message = "请求格式不合法：营业日期必须是 YYYY-MM-DD，三项检查项必须是布尔值"
     else:
         message = "请求格式不合法：配重片标识不能为空且不得包含不可见字符，重量必须是整数克数"
     return JSONResponse(
@@ -592,10 +603,141 @@ def remove_load(
     }
 
 
+def inspection_payload(record: Inspection) -> dict:
+    """日检记录的对外契约：结论、检查明细与记录时间全部来自数据库。"""
+    return {
+        "inspection_id": record.id,
+        "batten_id": record.batten_id,
+        "inspection_date": record.inspection_date.isoformat(),
+        "brake_ok": record.brake_ok,
+        "rope_ok": record.rope_ok,
+        "limit_ok": record.limit_ok,
+        "abnormality_note": record.abnormality_note,
+        "conclusion": record.conclusion,
+        "conclusion_label": CONCLUSION_LABELS[record.conclusion],
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+def _find_inspection(db: Session, batten_id: str, inspection_date: date):
+    return db.scalar(
+        select(Inspection)
+        .where(Inspection.batten_id == batten_id)
+        .where(Inspection.inspection_date == inspection_date)
+    )
+
+
+@app.post("/api/battens/{batten_id}/inspections", status_code=201)
+def create_inspection(
+    batten_id: str,
+    payload: InspectionCreate,
+    db: Session = Depends(get_db),
+):
+    """吊杆日检归档：每根吊杆同一营业日期只接纳一份记录。
+
+    结论由服务端判定：制动器、钢丝绳、限位装置三项全部正常为"合格"，
+    任一项异常为"需处理"，客户端不能指定结论。任一项异常时异常说明
+    不能为空。未知吊杆、未来日期、缺少异常说明一律按错误信封拒绝；
+    被拒绝的请求不落库，也不触碰配重装载 / 转移 / 修正 / 拆下数据。
+    """
+    batten = db.get(Batten, batten_id)
+    if batten is None:
+        return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {batten_id} 不存在")
+
+    # 营业日期不能是未来日期：日检只登记今天或以往的营业日
+    if payload.inspection_date > date.today():
+        return reject(
+            422,
+            "INVALID_DATE",
+            f"营业日期 {payload.inspection_date.isoformat()} 是未来日期，"
+            "日检只能登记今天或以往的营业日",
+        )
+
+    all_ok = payload.brake_ok and payload.rope_ok and payload.limit_ok
+    note = (payload.abnormality_note or "").strip()
+    if not all_ok and not note:
+        return reject(
+            422,
+            "MISSING_ABNORMALITY_NOTE",
+            "存在异常检查项时，异常说明不能为空",
+        )
+
+    # 每根吊杆同一营业日期只接纳一份：已归档则返回已完成提示，
+    # 并把已归档记录一并返回，便于页面展示既有结论
+    existing = _find_inspection(db, batten_id, payload.inspection_date)
+    if existing is not None:
+        return reject(
+            409,
+            "INSPECTION_EXISTS",
+            f"吊杆 {batten_id} {payload.inspection_date.isoformat()} 的日检已完成，"
+            "不能重复提交",
+            inspection=inspection_payload(existing),
+        )
+
+    # 结论只能由服务端根据三项检查结果判定，请求体中没有结论字段
+    conclusion = CONCLUSION_PASS if all_ok else CONCLUSION_NEEDS_ATTENTION
+    record = Inspection(
+        batten_id=batten_id,
+        inspection_date=payload.inspection_date,
+        brake_ok=payload.brake_ok,
+        rope_ok=payload.rope_ok,
+        limit_ok=payload.limit_ok,
+        abnormality_note=note or None,
+        conclusion=conclusion,
+    )
+    db.add(record)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发下同一吊杆同一营业日期的重复提交，由数据库唯一约束兜底
+        db.rollback()
+        existing = _find_inspection(db, batten_id, payload.inspection_date)
+        return reject(
+            409,
+            "INSPECTION_EXISTS",
+            f"吊杆 {batten_id} {payload.inspection_date.isoformat()} 的日检已完成，"
+            "不能重复提交",
+            inspection=inspection_payload(existing) if existing else None,
+        )
+    db.refresh(record)
+
+    return {
+        "accepted": True,
+        "message": (
+            f"吊杆 {batten_id} {payload.inspection_date.isoformat()} 日检已归档："
+            f"{CONCLUSION_LABELS[conclusion]}"
+        ),
+        "inspection": inspection_payload(record),
+    }
+
+
+@app.get("/api/battens/{batten_id}/inspections")
+def list_inspections(
+    batten_id: str,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+):
+    """按吊杆查看最近日检记录：按营业日期倒序，全部来自数据库。"""
+    batten = db.get(Batten, batten_id)
+    if batten is None:
+        return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {batten_id} 不存在")
+    records = db.scalars(
+        select(Inspection)
+        .where(Inspection.batten_id == batten_id)
+        .order_by(Inspection.inspection_date.desc(), Inspection.id.desc())
+        .limit(min(max(limit, 1), 50))
+    ).all()
+    return {
+        "batten_id": batten_id,
+        "inspections": [inspection_payload(record) for record in records],
+    }
+
+
 @app.post("/api/reset")
 def reset(db: Session = Depends(get_db)):
-    """恢复验收场景：清空全部装载记录，复位两根空吊杆。"""
+    """恢复验收场景：清空全部装载记录与日检记录，复位两根空吊杆。"""
     db.execute(delete(Load))
+    db.execute(delete(Inspection))
     ensure_fixture_battens(db)
     battens = db.scalars(select(Batten).order_by(Batten.id)).all()
     return {"battens": [batten_summary(db, batten) for batten in battens]}

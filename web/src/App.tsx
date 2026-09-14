@@ -3,15 +3,30 @@ import {
   correctLoadWeight,
   fetchBatten,
   fetchBattens,
+  fetchInspections,
   removeLoad,
+  submitInspection,
   submitLoad,
   transferLoad,
 } from './api';
-import type { BattenDetail, BattenSummary, LoadItem } from './types';
+import type {
+  BattenDetail,
+  BattenSummary,
+  InspectionRecord,
+  LoadItem,
+} from './types';
 
 interface Feedback {
   kind: 'success' | 'error';
   text: string;
+}
+
+// 本地营业日期（YYYY-MM-DD）：日检表单默认今天，未来日期由服务端拒绝
+function todayStr(): string {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
 }
 
 export default function App() {
@@ -30,6 +45,21 @@ export default function App() {
   const [correctionWeight, setCorrectionWeight] = useState('');
   // 待拆下的配重片（来自当前吊杆明细）；null 表示未进入拆下二次确认流程
   const [removing, setRemoving] = useState<LoadItem | null>(null);
+
+  // —— 吊杆日检：独立的日检区域，状态全部来自接口 ——
+  const [inspBatten, setInspBatten] = useState('G-01');
+  const [inspDate, setInspDate] = useState(todayStr);
+  const [brakeOk, setBrakeOk] = useState(true);
+  const [ropeOk, setRopeOk] = useState(true);
+  const [limitOk, setLimitOk] = useState(true);
+  const [note, setNote] = useState('');
+  // 本次提交的服务端归档结果（结论、明细、记录时间）；null 表示尚未提交
+  const [inspResult, setInspResult] = useState<InspectionRecord | null>(null);
+  const [inspFeedback, setInspFeedback] = useState<Feedback | null>(null);
+  const [inspHistory, setInspHistory] = useState<InspectionRecord[]>([]);
+  const [inspSubmitting, setInspSubmitting] = useState(false);
+  // 与装载区同一思路：丢弃过期的在途历史查询响应
+  const inspSeq = useRef(0);
 
   // 单调递增的刷新序号：放弃早于最新一次刷新返回的过期响应，
   // 避免上一个动作的在途拉取在新动作之后落地，把界面回滚成旧状态
@@ -54,6 +84,21 @@ export default function App() {
   useEffect(() => {
     void refresh(selected);
   }, [refresh, selected]);
+
+  // 日检历史永远以数据库为准：挂载、切换日检吊杆与每次提交后都重新拉取
+  const refreshInspections = useCallback(async (battenId: string) => {
+    const seq = ++inspSeq.current;
+    const res = await fetchInspections(battenId);
+    if (seq !== inspSeq.current) return;
+    setInspHistory(res.status === 200 ? res.body.inspections : []);
+  }, []);
+
+  useEffect(() => {
+    // 切换日检吊杆后，上一次的结果与提示不再适用于当前吊杆
+    setInspResult(null);
+    setInspFeedback(null);
+    void refreshInspections(inspBatten);
+  }, [inspBatten, refreshInspections]);
 
   // 切换吊杆后，上一根吊杆的待转移 / 待修正 / 待拆下配重片不再适用于当前明细
   useEffect(() => {
@@ -235,6 +280,55 @@ export default function App() {
     setCorrectionWeight('');
     // 无论成功或拒绝，都刷新该杆总重、余量与明细
     await refresh(selected);
+  }
+
+  async function handleInspectionSubmit(event: FormEvent) {
+    event.preventDefault();
+    setInspFeedback(null);
+    setInspResult(null);
+    if (!inspDate) {
+      setInspFeedback({ kind: 'error', text: '请选择营业日期' });
+      return;
+    }
+    // 页面预检与接口口径一致：任一项异常时说明不能为空；
+    // 结论不由页面判定，始终以服务端归档结果为准
+    const anyAbnormal = !brakeOk || !ropeOk || !limitOk;
+    const trimmedNote = note.trim();
+    if (anyAbnormal && !trimmedNote) {
+      setInspFeedback({
+        kind: 'error',
+        text: '存在异常检查项时，异常说明不能为空',
+      });
+      return;
+    }
+    setInspSubmitting(true);
+    try {
+      const { body } = await submitInspection(inspBatten, {
+        inspection_date: inspDate,
+        brake_ok: brakeOk,
+        rope_ok: ropeOk,
+        limit_ok: limitOk,
+        abnormality_note: trimmedNote || null,
+      });
+      if (body.accepted && body.inspection) {
+        setInspResult(body.inspection);
+        setInspFeedback({ kind: 'success', text: body.message });
+        // 复位为全部正常，便于下一根吊杆 / 下一个营业日的登记
+        setBrakeOk(true);
+        setRopeOk(true);
+        setLimitOk(true);
+        setNote('');
+      } else {
+        // 已完成 / 未来日期 / 缺少说明等拒绝：历史以数据库为准刷新
+        setInspFeedback({ kind: 'error', text: `已拒绝：${body.message}` });
+      }
+    } catch {
+      setInspFeedback({ kind: 'error', text: '网络错误，无法联系日检服务' });
+    } finally {
+      setInspSubmitting(false);
+    }
+    // 无论成功或拒绝，历史视图都重新拉取接口
+    await refreshInspections(inspBatten);
   }
 
   return (
@@ -480,6 +574,156 @@ export default function App() {
           )}
         </section>
       )}
+
+      <section aria-label="吊杆日检" className="inspection">
+        <h2>吊杆日检</h2>
+        <form className="inspection-form" noValidate onSubmit={handleInspectionSubmit}>
+          <label htmlFor="insp-batten">日检吊杆</label>
+          <select
+            id="insp-batten"
+            value={inspBatten}
+            onChange={(e) => setInspBatten(e.target.value)}
+          >
+            {battens.map((b) => (
+              <option key={b.batten_id} value={b.batten_id}>
+                {b.batten_id}
+              </option>
+            ))}
+          </select>
+
+          <label htmlFor="insp-date">营业日期</label>
+          <input
+            id="insp-date"
+            type="date"
+            value={inspDate}
+            max={todayStr()}
+            onChange={(e) => setInspDate(e.target.value)}
+          />
+
+          <span id="checks-label" className="checks-label">
+            检查项
+          </span>
+          <div className="checks" role="group" aria-labelledby="checks-label">
+            <label className="check" htmlFor="insp-brake">
+              <input
+                id="insp-brake"
+                type="checkbox"
+                checked={brakeOk}
+                onChange={(e) => setBrakeOk(e.target.checked)}
+              />
+              制动器正常
+            </label>
+            <label className="check" htmlFor="insp-rope">
+              <input
+                id="insp-rope"
+                type="checkbox"
+                checked={ropeOk}
+                onChange={(e) => setRopeOk(e.target.checked)}
+              />
+              钢丝绳正常
+            </label>
+            <label className="check" htmlFor="insp-limit">
+              <input
+                id="insp-limit"
+                type="checkbox"
+                checked={limitOk}
+                onChange={(e) => setLimitOk(e.target.checked)}
+              />
+              限位装置正常
+            </label>
+          </div>
+
+          <label htmlFor="insp-note">异常说明</label>
+          <textarea
+            id="insp-note"
+            rows={2}
+            value={note}
+            placeholder="任一项异常时必填"
+            onChange={(e) => setNote(e.target.value)}
+          />
+
+          <button type="submit" disabled={inspSubmitting}>
+            提交日检
+          </button>
+        </form>
+
+        {inspFeedback && (
+          <p
+            role={inspFeedback.kind === 'error' ? 'alert' : 'status'}
+            className={`feedback ${inspFeedback.kind}`}
+          >
+            {inspFeedback.text}
+          </p>
+        )}
+
+        {inspResult && (
+          <section aria-label="日检结果" className="inspection-result">
+            <h3>本次日检结果</h3>
+            <p>
+              结论：
+              <strong data-testid="insp-conclusion">
+                {inspResult.conclusion_label}
+              </strong>
+            </p>
+            <ul className="check-results">
+              <li>制动器：{inspResult.brake_ok ? '正常' : '异常'}</li>
+              <li>钢丝绳：{inspResult.rope_ok ? '正常' : '异常'}</li>
+              <li>限位装置：{inspResult.limit_ok ? '正常' : '异常'}</li>
+            </ul>
+            {inspResult.abnormality_note && (
+              <p>异常说明：{inspResult.abnormality_note}</p>
+            )}
+            <p>
+              记录时间：
+              {inspResult.created_at
+                ? new Date(inspResult.created_at).toLocaleString('zh-CN', {
+                    hour12: false,
+                  })
+                : ''}
+            </p>
+          </section>
+        )}
+
+        <section aria-label="日检记录" className="inspection-history">
+          <h3>{inspBatten} 最近日检记录</h3>
+          {inspHistory.length === 0 ? (
+            <p>暂无日检记录</p>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>营业日期</th>
+                  <th>结论</th>
+                  <th>制动器</th>
+                  <th>钢丝绳</th>
+                  <th>限位装置</th>
+                  <th>异常说明</th>
+                  <th>记录时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {inspHistory.map((rec) => (
+                  <tr key={rec.inspection_id}>
+                    <td>{rec.inspection_date}</td>
+                    <td>{rec.conclusion_label}</td>
+                    <td>{rec.brake_ok ? '正常' : '异常'}</td>
+                    <td>{rec.rope_ok ? '正常' : '异常'}</td>
+                    <td>{rec.limit_ok ? '正常' : '异常'}</td>
+                    <td>{rec.abnormality_note ?? '—'}</td>
+                    <td>
+                      {rec.created_at
+                        ? new Date(rec.created_at).toLocaleString('zh-CN', {
+                            hour12: false,
+                          })
+                        : ''}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      </section>
     </main>
   );
 }

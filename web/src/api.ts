@@ -2,6 +2,9 @@ import type {
   BattenDetail,
   BattenSummary,
   CorrectResult,
+  InspectionList,
+  InspectionResult,
+  InspectionSubmission,
   LoadResult,
   RemoveResult,
   TransferResult,
@@ -69,5 +72,21 @@ export function removeLoad(battenId: string, loadId: number) {
   return request<RemoveResult>(
     `/api/battens/${encodeURIComponent(battenId)}/loads/${loadId}/remove`,
     { method: 'POST' },
+  );
+}
+
+export function submitInspection(battenId: string, payload: InspectionSubmission) {
+  return request<InspectionResult>(
+    `/api/battens/${encodeURIComponent(battenId)}/inspections`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function fetchInspections(battenId: string, limit = 10) {
+  return request<InspectionList>(
+    `/api/battens/${encodeURIComponent(battenId)}/inspections?limit=${limit}`,
   );
 }
