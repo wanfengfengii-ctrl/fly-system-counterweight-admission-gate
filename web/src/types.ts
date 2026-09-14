@@ -26,3 +26,16 @@ export interface LoadResult {
   total_grams?: number;
   remaining_grams?: number;
 }
+
+export interface TransferResult {
+  accepted: boolean;
+  reason?: string;
+  message: string;
+  load_id?: number;
+  piece_id?: string;
+  weight_grams?: number;
+  source_batten_id?: string;
+  target_batten_id?: string;
+  source?: BattenSummary;
+  target?: BattenSummary;
+}

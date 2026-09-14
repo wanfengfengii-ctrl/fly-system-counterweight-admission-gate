@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
 from .models import Batten, Load
-from .schemas import LoadCreate
+from .schemas import LoadCreate, TransferCreate
 
 MIN_WEIGHT_GRAMS = 100
 MAX_WEIGHT_GRAMS = 25000
@@ -188,6 +188,106 @@ def create_load(batten_id: str, payload: LoadCreate, db: Session = Depends(get_d
             "piece_id": load.piece_id,
             "weight_grams": load.weight_grams,
         },
+    }
+
+
+def _lock_battens_in_fixed_order(db: Session, batten_ids: list[str]) -> dict[str, Batten]:
+    """按吊杆编号固定顺序加行锁。
+
+    转移涉及两根吊杆：无论方向是 G-01→G-02 还是 G-02→G-01，
+    都按同一顺序（编号升序）逐行 SELECT ... FOR UPDATE，
+    使相反方向的并发转移在锁队列上排成一队，避免相互等待形成死锁。
+    """
+    locked: dict[str, Batten] = {}
+    for bid in sorted(set(batten_ids)):
+        locked[bid] = db.scalar(
+            select(Batten).where(Batten.id == bid).with_for_update()
+        )
+    return locked
+
+
+@app.post("/api/battens/{batten_id}/loads/{load_id}/transfer")
+def transfer_load(
+    batten_id: str,
+    load_id: int,
+    payload: TransferCreate,
+    db: Session = Depends(get_db),
+):
+    """把一片已登记配重片从源吊杆转移到目标吊杆。
+
+    不新增/删除装载记录，只更新现有记录的归属，原始重量与登记时间保留。
+    源、目标两根吊杆在同一事务内以固定顺序锁定，随后确认配重片仍属于
+    源杆并校验目标余量，任一条件不满足则回滚，数据库保持原归属。
+    """
+    target_id = payload.target_batten_id
+    if target_id == batten_id:
+        return reject(
+            422,
+            "SAME_BATTEN",
+            f"目标吊杆不能与源吊杆 {batten_id} 相同",
+            source_batten_id=batten_id,
+            target_batten_id=target_id,
+        )
+
+    locked = _lock_battens_in_fixed_order(db, [batten_id, target_id])
+    source = locked.get(batten_id)
+    target = locked.get(target_id)
+    if source is None or target is None:
+        missing = batten_id if source is None else target_id
+        db.rollback()
+        return reject(404, "BATTEN_NOT_FOUND", f"吊杆 {missing} 不存在")
+
+    # 锁内再确认配重片归属：并发转移时后到者会看到已提交的新归属
+    load = db.scalar(
+        select(Load).where(Load.id == load_id).with_for_update()
+    )
+    if load is None or load.batten_id != batten_id:
+        db.rollback()
+        return reject(
+            409,
+            "POSITION_CHANGED",
+            f"配重片当前位置已变化：已不在源吊杆 {batten_id} 上，"
+            "可能已被其他终端转移",
+            source_batten_id=batten_id,
+            target_batten_id=target_id,
+            load_id=load_id,
+        )
+
+    target_summary = batten_summary(db, target)
+    new_target_total = target_summary["total_grams"] + load.weight_grams
+    if new_target_total > target.capacity_grams:
+        db.rollback()
+        return reject(
+            409,
+            "OVER_CAPACITY",
+            f"目标吊杆 {target_id} 当前总重 {target_summary['total_grams']} 克，"
+            f"配重片 {load.piece_id} 重 {load.weight_grams} 克，"
+            f"合计 {new_target_total} 克超出核定 {target.capacity_grams} 克",
+            source_batten_id=batten_id,
+            target_batten_id=target_id,
+            **{
+                f"target_{k}": v
+                for k, v in target_summary.items()
+                if k != "batten_id"
+            },
+        )
+
+    # 只改归属：weight_grams 与 created_at 原样保留
+    load.batten_id = target_id
+    db.commit()
+
+    source_summary = batten_summary(db, source)
+    target_summary = batten_summary(db, target)
+    return {
+        "accepted": True,
+        "message": f"配重片 {load.piece_id} 已从 {batten_id} 转移至 {target_id}",
+        "load_id": load.id,
+        "piece_id": load.piece_id,
+        "weight_grams": load.weight_grams,
+        "source_batten_id": batten_id,
+        "target_batten_id": target_id,
+        "source": source_summary,
+        "target": target_summary,
     }
 
 

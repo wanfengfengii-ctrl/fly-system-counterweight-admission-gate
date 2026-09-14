@@ -1,6 +1,6 @@
-import { FormEvent, useCallback, useEffect, useState } from 'react';
-import { fetchBatten, fetchBattens, submitLoad } from './api';
-import type { BattenDetail, BattenSummary } from './types';
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { fetchBatten, fetchBattens, submitLoad, transferLoad } from './api';
+import type { BattenDetail, BattenSummary, LoadItem } from './types';
 
 interface Feedback {
   kind: 'success' | 'error';
@@ -15,10 +15,20 @@ export default function App() {
   const [weight, setWeight] = useState('');
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // 待转移的配重片（来自当前吊杆明细）；null 表示未进入转移流程
+  const [transferring, setTransferring] = useState<LoadItem | null>(null);
+  const [transferTarget, setTransferTarget] = useState('');
 
-  // 页面状态永远以数据库为准：挂载与每次登记后都重新拉取
+  // 单调递增的刷新序号：放弃早于最新一次刷新返回的过期响应，
+  // 避免上一个动作的在途拉取在新动作之后落地，把界面回滚成旧状态
+  const refreshSeq = useRef(0);
+
+  // 页面状态永远以数据库为准：挂载与每次登记/转移后都重新拉取
   const refresh = useCallback(async (battenId: string) => {
+    const seq = ++refreshSeq.current;
     const [list, det] = await Promise.all([fetchBattens(), fetchBatten(battenId)]);
+    // 丢弃在更早动作中发出、却晚于最新刷新落地的过期响应
+    if (seq !== refreshSeq.current) return;
     if (list.status === 200) {
       setBattens(list.body.battens);
     }
@@ -32,6 +42,12 @@ export default function App() {
   useEffect(() => {
     void refresh(selected);
   }, [refresh, selected]);
+
+  // 切换吊杆后，上一根吊杆的待转移配重片不再适用于当前明细
+  useEffect(() => {
+    setTransferring(null);
+    setTransferTarget('');
+  }, [selected]);
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -62,6 +78,50 @@ export default function App() {
     } finally {
       setSubmitting(false);
     }
+    await refresh(selected);
+  }
+
+  function beginTransfer(load: LoadItem) {
+    setFeedback(null);
+    setTransferring(load);
+    // 默认目标为另一根吊杆
+    setTransferTarget(battens.find((b) => b.batten_id !== selected)?.batten_id ?? '');
+  }
+
+  function cancelTransfer() {
+    setTransferring(null);
+    setTransferTarget('');
+  }
+
+  async function confirmTransfer() {
+    if (!transferring || !transferTarget) return;
+    setFeedback(null);
+    setSubmitting(true);
+    try {
+      const { body } = await transferLoad(
+        selected,
+        transferring.load_id,
+        transferTarget,
+      );
+      if (body.accepted) {
+        setFeedback({
+          kind: 'success',
+          text: `${body.message}：${body.source_batten_id} 总重 ${body.source?.total_grams ?? ''} 克、剩余 ${body.source?.remaining_grams ?? ''} 克；${body.target_batten_id} 总重 ${body.target?.total_grams ?? ''} 克、剩余 ${body.target?.remaining_grams ?? ''} 克`,
+        });
+        setTransferring(null);
+        setTransferTarget('');
+      } else {
+        // 当前位置已变化等拒绝后，明细需要以数据库为准刷新
+        setFeedback({ kind: 'error', text: `已拒绝：${body.message}` });
+        setTransferring(null);
+        setTransferTarget('');
+      }
+    } catch {
+      setFeedback({ kind: 'error', text: '网络错误，无法联系装载裁决服务' });
+    } finally {
+      setSubmitting(false);
+    }
+    // 无论成功或拒绝，都刷新两根吊杆总重、余量与明细
     await refresh(selected);
   }
 
@@ -157,6 +217,8 @@ export default function App() {
                 <tr>
                   <th>配重片标识</th>
                   <th>重量（克）</th>
+                  <th>登记时间</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -164,10 +226,67 @@ export default function App() {
                   <tr key={load.load_id}>
                     <td>{load.piece_id}</td>
                     <td>{load.weight_grams}</td>
+                    <td>
+                      {load.created_at
+                        ? new Date(load.created_at).toLocaleString('zh-CN', {
+                            hour12: false,
+                          })
+                        : ''}
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="transfer-btn"
+                        aria-label={`转移 ${load.piece_id}`}
+                        onClick={() => beginTransfer(load)}
+                        disabled={submitting}
+                      >
+                        转移
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          )}
+
+          {transferring && (
+            <div className="transfer-panel" role="group" aria-label="转移确认">
+              <p>
+                将配重片 <strong>{transferring.piece_id}</strong>（
+                {transferring.weight_grams} 克）从 {selected} 转移到：
+              </p>
+              <label htmlFor="transfer-target">目标吊杆</label>
+              <select
+                id="transfer-target"
+                value={transferTarget}
+                onChange={(e) => setTransferTarget(e.target.value)}
+              >
+                {battens
+                  .filter((b) => b.batten_id !== selected)
+                  .map((b) => (
+                    <option key={b.batten_id} value={b.batten_id}>
+                      {b.batten_id}（剩余 {b.remaining_grams} 克）
+                    </option>
+                  ))}
+              </select>
+              <button
+                type="button"
+                className="confirm-transfer"
+                disabled={submitting || !transferTarget}
+                onClick={() => void confirmTransfer()}
+              >
+                确认转移
+              </button>
+              <button
+                type="button"
+                className="cancel-transfer"
+                disabled={submitting}
+                onClick={cancelTransfer}
+              >
+                取消
+              </button>
+            </div>
           )}
         </section>
       )}

@@ -138,3 +138,69 @@ td {
   border-bottom: 1px solid #eef1f4;
   text-align: left;
 }
+
+.transfer-btn {
+  padding: 5px 14px;
+  border: 1px solid #2563eb;
+  border-radius: 7px;
+  background: #fff;
+  color: #2563eb;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.transfer-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.transfer-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.transfer-panel p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.transfer-panel select {
+  padding: 7px 10px;
+  border: 1px solid #cbd2d9;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.confirm-transfer {
+  padding: 7px 16px;
+  border: none;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.cancel-transfer {
+  padding: 7px 16px;
+  border: 1px solid #cbd2d9;
+  border-radius: 8px;
+  background: #fff;
+  color: #374151;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.confirm-transfer:disabled,
+.cancel-transfer:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
